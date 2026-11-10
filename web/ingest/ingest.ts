@@ -7,7 +7,7 @@
  *
  * The export folder is only read, never written.
  */
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { encodePath, type RunRecord, type RunsFile } from '../src/lib/format.ts';
@@ -34,6 +34,8 @@ export interface Options {
 }
 
 export class UsageError extends Error {}
+/** Failure that is not about the arguments (e.g. the output can't be written): message only, exit 1. */
+export class IoError extends Error {}
 
 const USAGE = `usage: bun ingest/ingest.ts [strava export folder | folder of .fit/.gpx/.tcx] [options]
   (default input: the newest export_* folder in the repo root)
@@ -177,6 +179,7 @@ export interface Summary {
   homeFromOption: boolean;
   kept: number;
   cutAtSignalLoss: number;
+  truncated: number;
   points: number;
   years: [string, string] | null;
   skipped: [string, number][];
@@ -193,12 +196,16 @@ export function runIngest(o: Options): { file: RunsFile; summary: Summary } {
   const { list, fromCsv } = listActivities(o.input);
   let read = 0;
   let parsed = 0;
+  let truncated = 0;
   const seenFiles = new Set<string>();
+  // Strava sometimes attaches the same track to several activities under different file names, so
+  // duplicates are found by what the track contains, not by file name.
+  const seenTracks = new Map<string, string>();
   const cands: Candidate[] = [];
   for (const act of list) {
     if (fromCsv && !sportOk(act.type ?? '')) { skip(`not a ${o.sport} (activity type)`); continue; }
     if (!act.file) { skip('no GPS file in export (manual or indoor activity)'); continue; }
-    if (seenFiles.has(act.file)) { skip('same file as an earlier activity (duplicate)'); continue; }
+    if (seenFiles.has(act.file)) { skip('duplicate track (same GPS data as an earlier activity)'); continue; }
     seenFiles.add(act.file);
     if (!existsSync(act.file)) { skip('file listed in activities.csv is missing'); continue; }
     if (!formatOf(act.file)) { skip('unsupported file format'); continue; }
@@ -211,9 +218,14 @@ export function runIngest(o: Options): { file: RunsFile; summary: Summary } {
       continue;
     }
     parsed++;
+    if (raw.truncated) truncated++;
     if (!fromCsv && !sportOk(raw.sport)) { skip(`not a ${o.sport} (sport in file)`); continue; }
     const tr = toTrack(raw);
     if (!tr) { skip('no GPS track (fewer than 10 timed points)'); continue; }
+    const n = tr.t.length;
+    const sig = `${tr.start}|${n}|${tr.lat[0]}|${tr.lon[0]}|${tr.lat[n - 1]}|${tr.lon[n - 1]}|${tr.t[n - 1]}`;
+    if (seenTracks.has(sig)) { skip('duplicate track (same GPS data as an earlier activity)'); continue; }
+    seenTracks.set(sig, act.id);
     const day = new Date(tr.start * 1000).toISOString().slice(0, 10);
     if ((o.since && day < o.since) || (o.until && day > o.until)) { skip('outside --since/--until'); continue; }
     const c = clean(tr, o.maxSpeed);
@@ -278,20 +290,28 @@ export function runIngest(o: Options): { file: RunsFile; summary: Summary } {
     file,
     summary: {
       input: o.input, fromCsv, activities: list.length, read, parsed, home, homeFromOption: !!o.home,
-      kept: runs.length, cutAtSignalLoss, points,
+      kept: runs.length, cutAtSignalLoss, truncated, points,
       years: [runs[0].date.slice(0, 4), runs[runs.length - 1].date.slice(0, 4)],
       skipped: [...skipped].sort((a, b) => b[1] - a[1]),
     },
   };
 }
 
-/** Write atomically, so a failed run never leaves a half-written file behind. */
+/**
+ * Write atomically: into a temp file next to the output, then rename. On any failure the temp file
+ * (which holds GPS data) is removed and an existing output is left as it was.
+ */
 export function writeRuns(out: string, file: RunsFile): number {
-  mkdirSync(dirname(out), { recursive: true });
   const json = JSON.stringify(file);
-  const tmp = `${out}.tmp-${process.pid}`;
-  writeFileSync(tmp, json);
-  renameSync(tmp, out);
+  const tmp = join(dirname(out), `.${basename(out)}.tmp-${process.pid}`);
+  try {
+    mkdirSync(dirname(out), { recursive: true });
+    writeFileSync(tmp, json);
+    renameSync(tmp, out);
+  } catch (e) {
+    try { rmSync(tmp, { force: true }); } catch { /* nothing to clean up */ }
+    throw new IoError(`could not write ${out}: ${(e as Error).message}`);
+  }
   return json.length;
 }
 
@@ -304,6 +324,7 @@ export function formatSummary(s: Summary, radius: number, out: string, bytes: nu
     `home:          ${s.home[0].toFixed(4)}, ${s.home[1].toFixed(4)} ${s.homeFromOption ? '(--home)' : `(densest start cluster, ${radius} m)`}`,
     `runs kept:     ${s.kept}${s.years ? ` (${s.years[0]}-${s.years[1]})` : ''}`,
     `cut at signal loss: ${s.cutAtSignalLoss} of the kept runs`,
+    ...(s.truncated ? [`truncated:     ${s.truncated} files (partial data kept)`] : []),
     `points:        ${s.points}`,
     'skipped:',
     ...s.skipped.map(([why, n]) => `  ${String(n).padStart(5)}  ${why}`),
@@ -320,6 +341,10 @@ export function main(argv = process.argv.slice(2)): number {
     console.log(formatSummary(summary, o.radius, o.out, bytes));
     return 0;
   } catch (e) {
+    if (e instanceof IoError) {
+      console.error(`error: ${e.message}`);
+      return 1;
+    }
     if (e instanceof UsageError) {
       if (e.message) console.error(`error: ${e.message}\n`);
       console.error(USAGE);

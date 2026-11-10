@@ -37,3 +37,49 @@ export const run = (lonlat: number[], t: number[], extra: Partial<Run> = {}): Ru
   id: 'x', name: 'x', date: new Date(0), day: '2024-05-01', year: 2024, dist: 0, dur: t[t.length - 1], sd: 0,
   lonlat: Float64Array.from(lonlat), t: Float32Array.from(t), ...extra,
 });
+
+// ---------------------------------------------------------------- FIT
+
+export const FIT_EPOCH = 631065600;
+export const toSemi = (deg: number) => Math.round((deg * 2 ** 31) / 180);
+
+/** Tiny FIT writer: definitions, normal and compressed-timestamp data messages. */
+export class Fit {
+  body: number[] = [];
+  constructor(readonly le = true) {}
+  private u8(v: number) { this.body.push(v & 0xff); }
+  private n(v: number, size: number) {
+    const b = Array.from({ length: size }, (_, i) => Number((BigInt.asUintN(size * 8, BigInt(v)) >> BigInt(8 * i)) & 0xffn));
+    this.body.push(...(this.le ? b : b.reverse()));
+  }
+  /** fields: [field number, size] */
+  def(local: number, global: number, fields: [number, number][], devSizes: number[] = []) {
+    this.u8(0x40 | (devSizes.length ? 0x20 : 0) | local);
+    this.u8(0); this.u8(this.le ? 0 : 1); this.n(global, 2); this.u8(fields.length);
+    for (const [num, size] of fields) { this.u8(num); this.u8(size); this.u8(size === 4 ? 0x86 : 0x02); }
+    if (devSizes.length) {
+      this.u8(devSizes.length);
+      devSizes.forEach((s, i) => { this.u8(i); this.u8(s); this.u8(0); });
+    }
+    return this;
+  }
+  /** values: [value, size]; dev bytes are appended as zeros */
+  data(local: number, values: [number, number][], devBytes = 0) {
+    this.u8(local);
+    for (const [v, size] of values) this.n(v, size);
+    for (let i = 0; i < devBytes; i++) this.u8(0);
+    return this;
+  }
+  compressed(local: number, offset: number, values: [number, number][]) {
+    this.u8(0x80 | (local << 5) | (offset & 0x1f));
+    for (const [v, size] of values) this.n(v, size);
+    return this;
+  }
+  bytes(): Uint8Array {
+    const size = this.body.length;
+    const header = [14, 0x20, 0x08, 0x08, size & 0xff, (size >> 8) & 0xff, (size >> 16) & 0xff, (size >>> 24) & 0xff,
+      0x2e, 0x46, 0x49, 0x54, 0, 0];
+    return new Uint8Array([...header, ...this.body, 0, 0]);
+  }
+}
+

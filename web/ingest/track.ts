@@ -15,6 +15,8 @@ export interface RawTrack {
   lon: number[];
   time: number[];
   sport: string;
+  /** the file ended early or was corrupt; the points read before that are kept */
+  truncated?: boolean;
 }
 
 /** A track with time relative to its start. */

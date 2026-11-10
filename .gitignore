@@ -19,3 +19,4 @@ export_*/
 *.GPX
 *.TCX
 runs*.json
+*.tmp-*

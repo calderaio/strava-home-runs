@@ -2,50 +2,8 @@ import { describe, expect, test } from 'bun:test';
 import { gzipSync } from 'node:zlib';
 import { parseFit } from '../ingest/fit.ts';
 import { parseTrackBytes } from '../ingest/track.ts';
-import { HOME } from './fixtures.ts';
+import { Fit, FIT_EPOCH, HOME, toSemi } from './fixtures.ts';
 
-const FIT_EPOCH = 631065600;
-const toSemi = (deg: number) => Math.round((deg * 2 ** 31) / 180);
-
-/** Tiny FIT writer: definitions, normal and compressed-timestamp data messages. */
-class Fit {
-  body: number[] = [];
-  constructor(readonly le = true) {}
-  private u8(v: number) { this.body.push(v & 0xff); }
-  private n(v: number, size: number) {
-    const b = Array.from({ length: size }, (_, i) => Number((BigInt.asUintN(size * 8, BigInt(v)) >> BigInt(8 * i)) & 0xffn));
-    this.body.push(...(this.le ? b : b.reverse()));
-  }
-  /** fields: [field number, size] */
-  def(local: number, global: number, fields: [number, number][], devSizes: number[] = []) {
-    this.u8(0x40 | (devSizes.length ? 0x20 : 0) | local);
-    this.u8(0); this.u8(this.le ? 0 : 1); this.n(global, 2); this.u8(fields.length);
-    for (const [num, size] of fields) { this.u8(num); this.u8(size); this.u8(size === 4 ? 0x86 : 0x02); }
-    if (devSizes.length) {
-      this.u8(devSizes.length);
-      devSizes.forEach((s, i) => { this.u8(i); this.u8(s); this.u8(0); });
-    }
-    return this;
-  }
-  /** values: [value, size]; dev bytes are appended as zeros */
-  data(local: number, values: [number, number][], devBytes = 0) {
-    this.u8(local);
-    for (const [v, size] of values) this.n(v, size);
-    for (let i = 0; i < devBytes; i++) this.u8(0);
-    return this;
-  }
-  compressed(local: number, offset: number, values: [number, number][]) {
-    this.u8(0x80 | (local << 5) | (offset & 0x1f));
-    for (const [v, size] of values) this.n(v, size);
-    return this;
-  }
-  bytes(): Uint8Array {
-    const size = this.body.length;
-    const header = [14, 0x20, 0x08, 0x08, size & 0xff, (size >> 8) & 0xff, (size >> 16) & 0xff, (size >>> 24) & 0xff,
-      0x2e, 0x46, 0x49, 0x54, 0, 0];
-    return new Uint8Array([...header, ...this.body, 0, 0]);
-  }
-}
 
 const T0 = 1700000000;
 const PTS: [number, number, number][] = Array.from({ length: 12 }, (_, i) => [HOME[0] + i * 1e-4, HOME[1] + i * 1e-4, T0 + i]);
@@ -69,6 +27,7 @@ function buildFit(points: [number, number, number][], opts: { bigEndian?: boolea
 describe('FIT', () => {
   test('reads records, sport and a compressed timestamp', () => {
     const r = parseFit(buildFit(PTS));
+    expect(r.truncated).toBeUndefined();
     expect(r.sport).toBe('running');
     expect(r.lat.length).toBe(12);
     expect(r.time).toEqual(PTS.map((p) => p[2]));
@@ -117,6 +76,14 @@ describe('FIT', () => {
     expect(parseFit(w.bytes()).sport).toBe('cycling');
   });
 
+  test('sport also comes from the sport message, field 0 (not other fields)', () => {
+    const w = new Fit();
+    w.def(3, 12, [[1, 1], [0, 1], [2, 1]]).data(3, [[2, 1], [11, 1], [2, 1]]); // field 0 = walking; 1 and 2 = cycling
+    w.def(0, 20, REC);
+    PTS.forEach(([la, lo, ts]) => w.data(0, rec(la, lo, ts)));
+    expect(parseFit(w.bytes()).sport).toBe('walking');
+  });
+
   test('gzipped FIT via parseTrackBytes', () => {
     const r = parseTrackBytes(gzipSync(buildFit(PTS)), 'x.fit.gz');
     expect(r.lat.length).toBe(12);
@@ -131,6 +98,7 @@ describe('FIT', () => {
   test('a truncated file keeps the records read so far', () => {
     const full = buildFit(PTS);
     const r = parseFit(full.subarray(0, full.length - 40)); // cut inside the last records
+    expect(r.truncated).toBe(true);
     expect(r.lat.length).toBeGreaterThan(5);
     expect(r.lat.length).toBeLessThan(12);
     expect(r.time[0]).toBe(T0);

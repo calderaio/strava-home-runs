@@ -31,29 +31,34 @@ export function parseFit(buf: Uint8Array): RawTrack {
   let sport = '';
   let off = 0;
   let files = 0;
+  let truncated = false;
   while (off + 12 <= buf.length && isFit(buf.subarray(off))) {
     const headerSize = buf[off];
     const dataSize = dv.getUint32(off + 4, true);
     const start = off + headerSize;
     const end = Math.min(start + dataSize, buf.length);
-    sport = parseFile(dv, start, end, lat, lon, time) || sport;
+    if (start + dataSize > buf.length) truncated = true;
+    const r = parseFile(dv, start, end, lat, lon, time);
+    sport = r.sport || sport;
+    truncated ||= r.truncated;
     off = start + dataSize + 2; // skip CRC
     files++;
   }
   if (!files) throw new Error('not a FIT file');
-  return { lat, lon, time, sport };
+  return { lat, lon, time, sport, ...(truncated ? { truncated } : {}) };
 }
 
 /**
  * Decode one FIT file's records. A truncated or corrupt file stops the decode but keeps the records
  * read so far; it only throws if nothing usable was read.
  */
-function parseFile(dv: DataView, start: number, end: number, lat: number[], lon: number[], time: number[]): string {
+function parseFile(dv: DataView, start: number, end: number, lat: number[], lon: number[], time: number[]):
+  { sport: string; truncated: boolean } {
   const before = lat.length;
   try {
-    return decode(dv, start, end, lat, lon, time);
+    return { sport: decode(dv, start, end, lat, lon, time), truncated: false };
   } catch (e) {
-    if (lat.length > before) return (e as { sport?: string }).sport ?? '';
+    if (lat.length > before) return { sport: (e as { sport?: string }).sport ?? '', truncated: true };
     throw e;
   }
 }
