@@ -105,11 +105,34 @@ Pass a PNG or WebP of a face on a **transparent background** with `--face`. On m
 | `--font-title`, `--font-text`, `--font-clock` | system fonts | TTF/OTF files |
 | `--keep-frames` | | Keep the rendered PNGs in the work folder |
 
+## Web version
+
+`web/` holds a browser version that needs neither Blender nor ffmpeg: a [bun](https://bun.sh) script turns a Strava archive into a small `runs.json`, and a Vite page plays it on a MapLibre map (CARTO dark basemap, no API key) with deck.gl trails, then exports a 9:16 MP4 straight from the browser.
+
+```bash
+cd web
+bun install
+bun run ingest ~/Downloads/export_12345678  # the unzipped archive folder (with activities.csv)
+bun run dev                                # open http://localhost:5173
+```
+
+Without a folder argument, `bun run ingest` uses the newest `export_*/` folder in the repository root (ignored by git), so you can unzip the archive there.
+
+The ingest step reads `.fit`, `.gpx` and `.tcx` files, also gzipped, and takes the activity type and name from `activities.csv`. Without an `activities.csv` it scans the folder and uses the sport stored in each file. It cleans the tracks the same way as the Python tool, and takes the same `--radius`, `--home`, `--since`, `--until`, `--sport`, `--max-speed` and `--privacy-radius` options (`bun run ingest --help` lists them). It writes `web/data/runs.json`, which is gitignored because it holds your GPS tracks. The dev and preview servers serve it to the page; `bun run build` leaves it out of `web/dist/`.
+
+In the page you can play, pause, scrub and replay, change the speed and the video length, filter by date and start radius, and set the trail strength and titles. **Export MP4** renders the video frame by frame at 720×1280, 1080×1920 or 1440×2560 with WebCodecs, so frames are never dropped, however slow the machine. Each frame waits until the map tiles have loaded; if some never do, the export says which frames have gaps. "First … s" exports only the start, which is a quick test. Keep the tab visible while it exports: browsers pause background tabs, so the export stops if the tab is hidden. A recent Chrome or Edge works best. Browsers without WebCodecs fall back to MediaRecorder, which records in real time.
+
+The page loads map tiles from CARTO; everything else stays on your machine. `bun run dev` and `bun run preview` only listen on localhost. Don't start them with `--host`: that serves your `runs.json`, and so your tracks, to everyone on the local network.
+
+Other commands, all run in `web/`: `bun test`, `bun run typecheck` and `bun run build` (static files go to `web/dist/`, without your data).
+
 ## Privacy
 
 The video opens on your location of choice and every run leaves from it, which might show where you live.
 
 `--privacy-radius 300` cuts the first and last 300 m of every track. It also drops the shared start point, so each runner appears at the edge of the circle. Strava's privacy zones work the same way. With many runs though, the centre of the circle can still be estimated, so leave out the video if your address must stay private.
+
+In the web version, `--privacy-radius` does the same, and `runs.json` then leaves out each run's distance from home and the radius itself. That still doesn't hide home well: the trimmed tracks begin and end on a circle around it, and with hundreds of runs the centre of that circle can be found to within about a metre. Only the start and end are trimmed, so a run that passes near home in the middle still shows it. If your address must stay private, don't share the video or `runs.json`.
 
 ## How it works
 

@@ -8,3 +8,14 @@ __pycache__/
 .DS_Store
 .pixi/
 .venv/
+
+# Private Strava archive exports (GPS around home)
+export_*/
+*.zip
+
+# GPS files and generated run data, anywhere in the tree
+*.fit
+*.FIT
+*.GPX
+*.TCX
+runs*.json

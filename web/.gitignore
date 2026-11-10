@@ -1,0 +1,6 @@
+node_modules/
+dist/
+# generated from your private GPS data, never commit
+data/
+*.mp4
+*.webm

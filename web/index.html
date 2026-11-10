@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Home Runs</title>
+    <link rel="icon" href="data:," />
+  </head>
+  <body>
+    <div id="app">
+      <main id="viewer">
+        <div id="stage">
+          <div id="map"></div>
+          <canvas id="hud"></canvas>
+          <div id="message" hidden></div>
+        </div>
+      </main>
+      <aside id="panel">
+        <h1>Home runs</h1>
+
+        <section class="transport">
+          <div class="row">
+            <button id="play" type="button" disabled>Play</button>
+            <button id="replay" type="button" disabled>Replay</button>
+            <span id="readout" class="mono">0:00 / 0:00</span>
+          </div>
+          <input id="scrub" type="range" min="0" max="0" step="1" value="0" aria-label="Scrub" disabled />
+          <div class="row">
+            <label>Speed
+              <select id="speed">
+                <option value="0.25">0.25×</option>
+                <option value="0.5">0.5×</option>
+                <option value="1" selected>1×</option>
+                <option value="2">2×</option>
+                <option value="4">4×</option>
+              </select>
+            </label>
+            <label>Length <input id="seconds" type="number" min="5" max="300" step="1" value="30" /> s</label>
+          </div>
+          <p class="hint">Length is how many video seconds it takes until the longest run finishes.</p>
+        </section>
+
+        <section>
+          <h2>Filter</h2>
+          <div class="row">
+            <label>From <input id="from" type="date" /></label>
+            <label>To <input id="to" type="date" /></label>
+          </div>
+          <label class="block">Start within <span id="radius-val" class="mono">200 m</span> of home
+            <input id="radius" type="range" min="1" max="200" step="1" value="200" />
+          </label>
+          <p id="radius-note" class="hint"></p>
+          <p id="count" class="hint"></p>
+        </section>
+
+        <section>
+          <h2>Look</h2>
+          <label class="block">Trail strength <span id="strength-val" class="mono"></span>
+            <input id="strength" type="range" min="0.02" max="0.6" step="0.01" value="0.12" />
+          </label>
+          <label class="block">Title <input id="title" type="text" /></label>
+          <label class="block">Subtitle <input id="subtitle" type="text" /></label>
+        </section>
+
+        <section>
+          <h2>Export video</h2>
+          <div class="row">
+            <label>Size
+              <select id="size">
+                <option value="720x1280">720 × 1280</option>
+                <option value="1080x1920" selected>1080 × 1920</option>
+                <option value="1440x2560">1440 × 2560</option>
+              </select>
+            </label>
+            <label>First <input id="limit" type="number" min="1" step="1" placeholder="all" /> s</label>
+          </div>
+          <div class="row">
+            <button id="export" type="button" disabled>Export MP4</button>
+            <button id="cancel" type="button" hidden>Cancel</button>
+          </div>
+          <progress id="progress" max="1" value="0" hidden></progress>
+          <p id="export-status" class="hint">Renders every frame in turn (not in real time). Keep this tab visible while it runs.</p>
+        </section>
+
+        <section>
+          <h2>Privacy</h2>
+          <p id="privacy" class="hint"></p>
+        </section>
+
+        <section id="load" hidden>
+          <h2>Data</h2>
+          <label class="block">Load runs.json <input id="file" type="file" accept=".json,application/json" /></label>
+        </section>
+
+        <footer>
+          Map © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors
+          © <a href="https://carto.com/attributions" target="_blank" rel="noopener">CARTO</a>.
+          Rendered with <a href="https://maplibre.org/" target="_blank" rel="noopener">MapLibre</a> and
+          <a href="https://deck.gl/" target="_blank" rel="noopener">deck.gl</a>.
+        </footer>
+      </aside>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
