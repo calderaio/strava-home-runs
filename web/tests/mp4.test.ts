@@ -32,8 +32,11 @@ const mvhd1 = (timescale: number, duration: number) => {
 
 describe('mp4 layout', () => {
   test('moov before mdat is fast start, and the duration comes from mvhd', () => {
-    const f = cat(box('ftyp', new Uint8Array(8)), box('moov', cat(mvhd0(1000, 36500), box('trak'))), box('mdat', new Uint8Array(50)));
+    const f = cat(box('ftyp', new Uint8Array(8)), box('moov', cat(mvhd0(15360, 15360 * 36.5), box('trak'))), box('mdat', new Uint8Array(50)));
     expect(mp4Layout(f)).toEqual({ boxes: ['ftyp', 'moov', 'mdat'], fastStart: true, duration: 36.5 });
+    // timescale and duration are both read, not assumed
+    expect(mp4Layout(cat(box('moov', mvhd0(1000, 36500)), box('mdat'))).duration).toBe(36.5);
+    expect(mp4Layout(cat(box('moov', mvhd0(30, 1095)), box('mdat'))).duration).toBe(36.5);
   });
 
   test('moov after mdat is not fast start; version 1 mvhd works', () => {
