@@ -208,18 +208,43 @@ export function findHome(starts: [number, number][], radius: number): [number, n
   return [sa / c, sb / c];
 }
 
+export interface HomeCluster {
+  lat: number;
+  lon: number;
+  members: number[]; // indices into the starts array
+}
+
+/**
+ * Every place many runs start from: the densest start cluster (findHome), then the densest among the
+ * remaining starts, and so on, while a cluster has at least `minRuns` starts within `radius`.
+ */
+export function findHomes(starts: [number, number][], radius: number, minRuns: number): HomeCluster[] {
+  let remaining = starts.map((_, i) => i);
+  const out: HomeCluster[] = [];
+  while (remaining.length >= Math.max(1, minRuns)) {
+    const [lat, lon] = findHome(remaining.map((i) => starts[i]), radius);
+    const members = remaining.filter((i) => distTo(starts[i][0], starts[i][1], [lat, lon]) <= radius);
+    if (members.length < Math.max(1, minRuns)) break;
+    out.push({ lat, lon, members });
+    const taken = new Set(members);
+    remaining = remaining.filter((i) => !taken.has(i));
+  }
+  return out;
+}
+
 export function distTo(lat: number, lon: number, home: [number, number]): number {
   const [ky, kx] = metresPerDegree(home[0]);
   return Math.hypot((lat - home[0]) * ky, (lon - home[1]) * kx);
 }
 
-/** Remove the start and end of a track inside `radius` metres of home (like a privacy zone). */
-export function hideEnds(tr: Track, home: [number, number], radius: number): Track | null {
+/** Remove the start and end of a track inside `radius` metres of home, or of any of several homes (like a privacy zone). */
+export function hideEnds(tr: Track, home: [number, number] | [number, number][], radius: number): Track | null {
+  const homes = (typeof home[0] === 'number' ? [home] : home) as [number, number][];
   const n = tr.t.length;
   const out = new Array<boolean>(n);
   let count = 0;
   for (let i = 0; i < n; i++) {
-    out[i] = distTo(tr.lat[i], tr.lon[i], home) > radius;
+    out[i] = homes.every((h) => distTo(tr.lat[i], tr.lon[i], h) > radius);
     if (out[i]) count++;
   }
   if (count < MIN_POINTS) return null;

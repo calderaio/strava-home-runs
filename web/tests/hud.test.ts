@@ -51,5 +51,7 @@ describe('counters and labels', () => {
     expect(defaultTitles([...withDur([1], 2020), ...withDur([1], 2026)]))
       .toEqual({ title: 'HOME RUNS since 2020', subtitle: '2 runs between 2020 and 2026' });
     expect(defaultTitles(withDur([1], 2022)).subtitle).toBe('1 run in 2022');
+    expect(defaultTitles(withDur([1], 2022), '  Harbour ').subtitle).toBe('1 run in 2022, Harbour'); // the home's name, like --place
+    expect(defaultTitles(withDur([1], 2022), ' ').subtitle).toBe('1 run in 2022');
   });
 });

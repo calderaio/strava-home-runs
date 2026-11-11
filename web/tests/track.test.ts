@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { clean, distTo, downsample, findHome, hideEnds, metresPerDegree, type Track } from '../ingest/track.ts';
+import { clean, distTo, downsample, findHome, findHomes, hideEnds, metresPerDegree, type Track } from '../ingest/track.ts';
 import { HOME, offset } from './fixtures.ts';
 
 const [, KX] = metresPerDegree(HOME[0]);
@@ -40,6 +40,40 @@ describe('home detection', () => {
     const h = findHome([offset(0), offset(30), offset(60), offset(900)], 100);
     // start 30 m sees all three (0, 30, 60); the mean is at 30 m
     expect((h[1] - HOME[1]) * KX).toBeCloseTo(30, 6);
+  });
+});
+
+describe('home candidates', () => {
+  const cluster = (east: number, north: number, n: number) => Array.from({ length: n }, (_, k) => offset(east + (k % 4) * 10, north + (k % 3) * 10));
+
+  test('finds every place with enough starts, densest first, each start counted once', () => {
+    const starts = [...cluster(50000, 0, 12), ...cluster(0, 0, 30), ...cluster(0, 800, 15), ...cluster(-90000, 0, 9), offset(7000, 7000)];
+    const homes = findHomes(starts, 200, 10);
+    expect(homes.map((h) => h.members.length)).toEqual([30, 15, 12]); // the 9-run place is below the minimum
+    expect(distTo(homes[0].lat, homes[0].lon, offset(15, 10))).toBeLessThan(10);
+    expect(distTo(homes[1].lat, homes[1].lon, offset(15, 810))).toBeLessThan(10);
+    expect(distTo(homes[2].lat, homes[2].lon, offset(50015, 10))).toBeLessThan(10);
+    const all = homes.flatMap((h) => h.members);
+    expect(new Set(all).size).toBe(all.length);
+    expect(homes[0].members.every((i) => i >= 12 && i < 42)).toBe(true);
+  });
+
+  test('the minimum is inclusive, and a high minimum finds nothing', () => {
+    const starts = [...cluster(0, 0, 10), ...cluster(5000, 0, 9)];
+    expect(findHomes(starts, 200, 10).map((h) => h.members.length)).toEqual([10]);
+    expect(findHomes(starts, 200, 9).map((h) => h.members.length)).toEqual([10, 9]);
+    expect(findHomes(starts, 200, 11)).toEqual([]);
+    expect(findHomes([], 200, 1)).toEqual([]);
+  });
+
+  test('privacy trimming around several homes', () => {
+    const e = [...line(201), ...line(200).reverse()]; // 600 m out and back from HOME
+    const other = offset(600); // a second home at the turning point
+    const h = hideEnds(track(e), [HOME, other], 150)!;
+    for (let i = 0; i < h.t.length; i++) {
+      expect(distTo(h.lat[i], h.lon[i], HOME)).toBeGreaterThan(150);
+    }
+    expect(Math.max(...Array.from(h.lon, (x) => (x - HOME[1]) * KX))).toBeGreaterThan(450); // the middle stays
   });
 });
 

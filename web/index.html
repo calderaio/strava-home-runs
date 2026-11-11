@@ -41,13 +41,26 @@
         </section>
 
         <section>
+          <h2>Home</h2>
+          <select id="home" aria-label="Home"></select>
+          <label class="block">Name <input id="home-name" type="text" maxlength="80" placeholder="e.g. the neighbourhood" /></label>
+          <div class="row">
+            <button id="pick" type="button">Pick on map</button>
+            <button id="pick-cancel" type="button" hidden>Cancel</button>
+            <button id="forget" type="button" hidden>Remove this home</button>
+          </div>
+          <p id="pick-status" class="hint"></p>
+          <p id="home-note" class="hint"></p>
+        </section>
+
+        <section>
           <h2>Filter</h2>
           <div class="row">
             <label>From <input id="from" type="date" /></label>
             <label>To <input id="to" type="date" /></label>
           </div>
           <label class="block">Start within <span id="radius-val" class="mono">200 m</span> of home
-            <input id="radius" type="range" min="1" max="200" step="1" value="200" />
+            <input id="radius" type="range" min="5" max="2000" step="5" value="200" />
           </label>
           <p id="radius-note" class="hint"></p>
           <p id="count" class="hint"></p>
@@ -85,6 +98,9 @@
 
         <section>
           <h2>Privacy</h2>
+          <label class="block">Hide the ends within <span id="privacy-val" class="mono">0 m</span> of home
+            <input id="privacy-radius" type="range" min="0" max="1000" step="25" value="0" />
+          </label>
           <p id="privacy" class="hint"></p>
         </section>
 

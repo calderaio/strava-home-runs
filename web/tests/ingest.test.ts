@@ -52,32 +52,35 @@ beforeAll(() => {
 });
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
 
-const opts = (extra: string[] = []) => parseArgs([dir, '--out', join(dir, 'out', 'runs.json'), ...extra]);
+const opts = (extra: string[] = []) => parseArgs([dir, '--out', join(dir, 'out', 'runs.json'), '--min-home-runs', '2', ...extra]);
 
 describe('ingest', () => {
-  test('keeps runs from home and reports every skip', () => {
+  test('keeps every run with GPS, finds the home and reports every skip', () => {
     const { file, summary } = runIngest(opts(['--since', '2020-01-01']));
     expect(summary.activities).toBe(12);
-    expect(summary.kept).toBe(4);
-    expect(file.runs.map((r) => r.id)).toEqual(['1', '2', '8', '12']);
+    expect(summary.kept).toBe(5);
+    expect(file.runs.map((r) => r.id)).toEqual(['1', '2', '5', '8', '12']); // incl. the run from 5 km away
     expect(summary.truncated).toBe(1);
-    expect(distTo(summary.home[0], summary.home[1], HOME)).toBeLessThan(60);
+    expect(file.meta.homes.length).toBe(1); // the far start is a single run, below --min-home-runs
+    const [h] = file.meta.homes;
+    expect(distTo(h.lat, h.lon, HOME)).toBeLessThan(60);
+    expect([h.runs, h.first, h.last]).toEqual([4, 2024, 2024]);
+    expect(summary.homes).toEqual(file.meta.homes);
     expect(summary.cutAtSignalLoss).toBe(1);
     expect(Object.fromEntries(summary.skipped)).toEqual({
       'duplicate track (same GPS data as an earlier activity)': 2,
       'not a run (activity type)': 1,
-      'starts more than 200 m from home': 1,
       'no GPS file in export (manual or indoor activity)': 1,
       'outside --since/--until': 1,
       'no GPS track (fewer than 10 timed points)': 1,
       'file listed in activities.csv is missing': 1,
     });
-    const [a, , g, k] = file.runs;
+    const byId = (id: string) => file.runs.find((r) => r.id === id)!;
+    const [a, g, k] = [byId('1'), byId('8'), byId('12')];
     expect(a.csvDist).toBe(2500);                  // Strava's number is kept separately...
     expect(Math.abs(a.dist - 1797)).toBeLessThan(5); // ...dist is what is animated (600 points, 3 m apart)
     expect(k.dur).toBeLessThan(299);               // only the part before the cut
     expect(g.dist).toBeLessThan(950);              // cut before the jump: only ~900 m are animated
-    expect(a.sd).toBeLessThan(60);
     expect(file.meta.privacyTrimmed).toBe(false);
     // decoded paths start at the first point and run at real pace
     const [ra] = decodeRuns(file);
@@ -86,32 +89,48 @@ describe('ingest', () => {
   });
 
   test('date range and --home', () => {
-    expect(runIngest(opts()).summary.kept).toBe(5); // the 2019 run counts without --since
+    expect(runIngest(opts()).summary.kept).toBe(6); // the 2019 run counts without --since
     expect(runIngest(opts(['--until', '2024-05-01'])).file.runs.map((r) => r.id)).toEqual(['7', '1']);
     // both ends are inclusive (the run on 2024-05-01 starts at 07:00 UTC)
-    expect(runIngest(opts(['--since', '2024-05-01', '--until', '2024-05-01'])).file.runs.map((r) => r.id)).toEqual(['1']);
-    expect(runIngest(opts(['--since', '2024-05-02', '--until', '2024-05-02'])).file.runs.map((r) => r.id)).toEqual(['2']);
-    const far = runIngest(opts(['--home', `${offset(5000)[0]},${offset(5000)[1]}`]));
-    expect(far.file.runs.map((r) => r.id)).toEqual(['5']);
-    expect(far.summary.homeFromOption).toBe(true);
+    expect(runIngest(opts(['--since', '2024-05-01', '--until', '2024-05-01', '--min-home-runs', '1'])).file.runs.map((r) => r.id)).toEqual(['1']);
+    expect(runIngest(opts(['--since', '2024-05-02', '--until', '2024-05-02', '--min-home-runs', '1'])).file.runs.map((r) => r.id)).toEqual(['2']);
+    // --home adds a home first...
+    const far = runIngest(opts(['--home', `${offset(5000)[0]},${offset(5000)[1]}`])).file.meta.homes;
+    expect(far.map((h) => [h.runs, !!h.fromOption])).toEqual([[1, true], [5, false]]);
+    // ...or replaces the detected home it is close to
+    const near = runIngest(opts(['--home', `${offset(50)[0]},${offset(50)[1]}`])).file.meta.homes;
+    expect(near.length).toBe(1);
+    expect(near[0].fromOption).toBe(true);
+    expect(distTo(near[0].lat, near[0].lon, offset(50))).toBeLessThan(1e-6);
+    // fewer starts than --min-home-runs anywhere: no home, an error
+    expect(() => runIngest(opts(['--min-home-runs', '50']))).toThrow(/no place has 50 or more runs/);
   });
 
-  test('privacy trimming leaves out start distances and the radius', () => {
+  test('privacy trimming trims around every home and rounds the homes', () => {
+    const plain = runIngest(opts()).file.meta.homes[0];
     const { file } = runIngest(opts(['--privacy-radius', '300']));
     expect(file.meta.privacyTrimmed).toBe(true);
     expect(JSON.stringify(file.meta)).not.toContain('300');
-    for (const r of file.runs) expect(r.sd).toBeUndefined();
-    for (const r of decodeRuns(file)) expect(distTo(r.lonlat[1], r.lonlat[0], HOME)).toBeGreaterThan(290);
+    const [h] = file.meta.homes;
+    expect(h.lat).toBe(Math.round(plain.lat * 100) / 100);
+    expect(h.lon).toBe(Math.round(plain.lon * 100) / 100);
+    expect(file.meta.radius).toBe(1500); // looser default filter for the approximate starts
+    for (const r of decodeRuns(file)) {
+      const d0 = distTo(r.lonlat[1], r.lonlat[0], HOME);
+      expect(d0 > 290 || r.id === '5').toBe(true); // the far run starts far away anyway
+    }
   });
 
   test('main(): writes the file, prints the summary, exits 0', () => {
     const log = spyOn(console, 'log').mockImplementation(() => {});
     try {
       const out = join(dir, 'ok', 'runs.json');
-      expect(main([dir, '--out', out])).toBe(0);
-      expect(JSON.parse(readFileSync(out, 'utf8')).runs.length).toBe(5);
+      expect(main([dir, '--out', out, '--min-home-runs', '2'])).toBe(0);
+      expect(JSON.parse(readFileSync(out, 'utf8')).runs.length).toBe(6);
       const text = String(log.mock.calls[0][0]);
-      expect(text).toContain('runs kept:     5');
+      expect(text).toContain('runs kept:     6 with GPS');
+      expect(text).toContain('homes:         1');
+      expect(text).toMatch(/ 1\. -\d+\.\d{4}, -\d+\.\d{4} · 5 runs · 2019-2024/);
       expect(text).toContain('cut at signal loss: 1');
       expect(text).toContain('truncated:     1 files (partial data kept)');
       expect(text).toContain('2  duplicate track (same GPS data as an earlier activity)');
@@ -127,10 +146,11 @@ describe('ingest', () => {
       mkdirSync(join(dir, 'keep'));
       writeFileSync(out, 'previous');
       expect(main([dir, '--out', out, '--home', '0,0'])).toBe(2);
+      expect(main([dir, '--out', out])).toBe(2); // 6 runs: no place has the default 10
       expect(main([dir, '--out', out, '--sport', 'swim'])).toBe(2);
       expect(main([dir, '--out', out, '--since', '2030-01-01'])).toBe(2);
       expect(readFileSync(out, 'utf8')).toBe('previous');
-      expect(String(err.mock.calls[0][0])).toContain('no runs start within');
+      expect(String(err.mock.calls[0][0])).toContain('no runs start within 200 m of --home');
     } finally {
       err.mockRestore();
     }
@@ -144,7 +164,7 @@ describe('ingest', () => {
     expect(readdirSync(outDir)).toEqual(['runs.json']);
     const err = spyOn(console, 'error').mockImplementation(() => {});
     try {
-      expect(main([dir, '--out', join(outDir, 'runs.json')])).toBe(1);
+      expect(main([dir, '--out', join(outDir, 'runs.json'), '--min-home-runs', '2'])).toBe(1);
       expect(String(err.mock.calls[0][0])).toMatch(/^error: could not write/);
       expect(readdirSync(outDir)).toEqual(['runs.json']);
     } finally {
@@ -156,7 +176,7 @@ describe('ingest', () => {
     const bad = [
       ['--radius', '-5'], ['--radius', '0'], ['--radius', 'abc'], ['--home', '0'], ['--home', '91,0'], ['--home', ',5'],
       ['--since', '2024-13-45'], ['--until', '2023-02-30'], ['--since', '2024-05-02', '--until', '2024-05-01'],
-      ['--max-speed', '0'], ['--privacy-radius', '-1'], ['--bogus'], ['--out'],
+      ['--max-speed', '0'], ['--privacy-radius', '-1'], ['--min-home-runs', '0'], ['--bogus'], ['--out'],
     ];
     for (const b of bad) expect(() => parseArgs([dir, ...b]), b.join(' ')).toThrow(UsageError);
     expect(parseArgs([dir, '--since', '2024-02-29']).since).toBe('2024-02-29');
@@ -174,9 +194,9 @@ describe('ingest', () => {
   });
 
   test('without activities.csv it scans the files and uses their sport', () => {
-    const { summary, file } = runIngest(parseArgs([join(dir, 'activities')]));
+    const { summary, file } = runIngest(parseArgs([join(dir, 'activities'), '--min-home-runs', '2']));
     expect(summary.fromCsv).toBe(false);
     // a-copy.gpx.gz and a.gpx hold the same track: only the first in sorted order is kept
-    expect(file.runs.map((r) => r.id).sort()).toEqual(['a-copy', 'b', 'e', 'g', 'k']);
+    expect(file.runs.map((r) => r.id).sort()).toEqual(['a-copy', 'b', 'd', 'e', 'g', 'k']);
   });
 });

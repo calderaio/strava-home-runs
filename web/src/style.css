@@ -117,3 +117,4 @@ a { color: var(--text); }
   #viewer { height: 72vh; flex: none; }
   #panel { flex: none; border-left: 0; border-top: 1px solid var(--line); }
 }
+#stage.picking #map canvas { cursor: crosshair; }

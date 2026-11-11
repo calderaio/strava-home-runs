@@ -10,10 +10,10 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { encodePath, type RunRecord, type RunsFile } from '../src/lib/format.ts';
+import { encodePath, type HomeCandidate, type RunRecord, type RunsFile } from '../src/lib/format.ts';
 import { parseCsv } from './csv.ts';
 import {
-  clean, distTo, downsample, findHome, formatOf, hideEnds, parseTrackBytes, pathLength, toTrack, type Track,
+  clean, distTo, downsample, findHomes, formatOf, hideEnds, parseTrackBytes, pathLength, toTrack, type Track,
 } from './track.ts';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -30,6 +30,7 @@ export interface Options {
   privacyRadius: number;
   minDt: number;
   minDist: number;
+  minHomeRuns: number;
   out: string;
 }
 
@@ -39,13 +40,14 @@ export class IoError extends Error {}
 
 const USAGE = `usage: bun ingest/ingest.ts [strava export folder | folder of .fit/.gpx/.tcx] [options]
   (default input: the newest export_* folder in the repo root)
-  --radius <m>          runs must start within this many metres of home (200)
-  --home <lat,lon>      home location (default: the place where most runs start)
+  --radius <m>          a home's runs start within this many metres of it; the page's default (200)
+  --home <lat,lon>      add this home first (or replace the detected home it is close to)
+  --min-home-runs <n>   a place needs this many run starts to become a home candidate (10)
   --since <YYYY-MM-DD>  first date to include (UTC)
   --until <YYYY-MM-DD>  last date to include (UTC)
   --sport <name>        keep activities whose type contains this; "any" keeps all (run)
   --max-speed <m/s>     faster GPS jumps are dropped as spikes (7)
-  --privacy-radius <m>  trim each track's start and end inside this radius of home (0)
+  --privacy-radius <m>  trim each track's start and end inside this radius of every home (0)
   --min-dt <s>          minimum time between kept points (5)
   --min-dist <m>        minimum distance between kept points (10)
   --out <file>          output JSON (web/data/runs.json)`;
@@ -59,7 +61,7 @@ const isDay = (v: string) => {
 export function parseArgs(argv: string[]): Options {
   const o: Options = {
     input: '', radius: 200, home: null, since: null, until: null, sport: 'run', maxSpeed: 7,
-    privacyRadius: 0, minDt: 5, minDist: 10, out: join(HERE, '..', 'data', 'runs.json'),
+    privacyRadius: 0, minDt: 5, minDist: 10, minHomeRuns: 10, out: join(HERE, '..', 'data', 'runs.json'),
   };
   const num = (k: string, v: string | undefined, min: number, strict = false) => {
     const n = Number(v);
@@ -94,6 +96,7 @@ export function parseArgs(argv: string[]): Options {
       case '--privacy-radius': o.privacyRadius = num(a, v, 0); i++; break;
       case '--min-dt': o.minDt = num(a, v, 0); i++; break;
       case '--min-dist': o.minDist = num(a, v, 0); i++; break;
+      case '--min-home-runs': o.minHomeRuns = Math.round(num(a, v, 1)); i++; break;
       case '--out':
         if (!v || v.startsWith('--')) throw new UsageError('--out needs a path');
         o.out = resolve(v); i++; break;
@@ -175,8 +178,7 @@ export interface Summary {
   activities: number;
   read: number;
   parsed: number;
-  home: [number, number];
-  homeFromOption: boolean;
+  homes: HomeCandidate[];
   kept: number;
   cutAtSignalLoss: number;
   truncated: number;
@@ -185,7 +187,7 @@ export interface Summary {
   skipped: [string, number][];
 }
 
-interface Candidate { act: Activity; track: Track; startDist: number }
+interface Candidate { act: Activity; track: Track }
 
 /** Read, clean and encode the runs. Throws UsageError when nothing usable is left. Does not write. */
 export function runIngest(o: Options): { file: RunsFile; summary: Summary } {
@@ -230,27 +232,45 @@ export function runIngest(o: Options): { file: RunsFile; summary: Summary } {
     if ((o.since && day < o.since) || (o.until && day > o.until)) { skip('outside --since/--until'); continue; }
     const c = clean(tr, o.maxSpeed);
     if (c.t.length < 2) { skip('too few points after GPS cleaning'); continue; }
-    cands.push({ act, track: c, startDist: 0 });
+    cands.push({ act, track: c });
   }
   if (!cands.length) throw new UsageError('no timed GPS tracks of the requested sport and dates');
 
-  const home = o.home ?? findHome(cands.map((c) => [c.track.lat[0], c.track.lon[0]]), o.radius);
-  if (!home.every(Number.isFinite)) throw new UsageError('could not determine home');
-  const kept: Candidate[] = [];
-  for (const c of cands) {
-    c.startDist = distTo(c.track.lat[0], c.track.lon[0], home);
-    if (c.startDist <= o.radius) kept.push(c);
-    else skip(`starts more than ${o.radius} m from home`);
+  // home candidates: every place with enough run starts, densest first; --home goes first
+  const starts = cands.map((c): [number, number] => [c.track.lat[0], c.track.lon[0]]);
+  const year = (i: number) => new Date(cands[i].track.start * 1000).getUTCFullYear();
+  const candidate = (lat: number, lon: number, fromOption = false): HomeCandidate => {
+    const near = starts.flatMap((s, i) => (distTo(s[0], s[1], [lat, lon]) <= o.radius ? [i] : []));
+    const years = near.map(year);
+    return {
+      lat, lon, runs: near.length, first: years.length ? Math.min(...years) : 0, last: years.length ? Math.max(...years) : 0,
+      ...(fromOption ? { fromOption } : {}),
+    };
+  };
+  let homes = findHomes(starts, o.radius, o.minHomeRuns).map((h) => candidate(h.lat, h.lon));
+  if (o.home) {
+    const [lat, lon] = o.home;
+    homes = [candidate(lat, lon, true), ...homes.filter((h) => distTo(h.lat, h.lon, o.home!) > o.radius)];
+  }
+  if (!homes.length) {
+    throw new UsageError(`no place has ${o.minHomeRuns} or more runs starting within ${o.radius} m; `
+      + 'try a larger --radius, a smaller --min-home-runs or --home lat,lon');
+  }
+  if (homes[0].runs === 0) {
+    throw new UsageError(`no runs start within ${o.radius} m of --home ${o.home![0]},${o.home![1]}; try a larger --radius`);
   }
 
-  const ref: [number, number] = [Math.round(home[1] * 100) / 100, Math.round(home[0] * 100) / 100];
+  // Every run with GPS is kept, so the page can show the runs of any home. With --privacy-radius the
+  // ends near every home are trimmed and the homes are stored rounded to ~1 km.
+  const homePoints = homes.map((h): [number, number] => [h.lat, h.lon]);
+  const ref: [number, number] = [Math.round(homes[0].lon * 100) / 100, Math.round(homes[0].lat * 100) / 100];
   const runs: RunRecord[] = [];
   let points = 0;
   let cutAtSignalLoss = 0;
-  for (const c of kept) {
+  for (const c of cands) {
     let tr: Track | null = c.track;
     if (o.privacyRadius > 0) {
-      tr = hideEnds(tr, home, o.privacyRadius);
+      tr = hideEnds(tr, homePoints, o.privacyRadius);
       if (!tr) { skip('nothing left outside --privacy-radius'); continue; }
     }
     const animatedDist = pathLength(tr);
@@ -264,24 +284,24 @@ export function runIngest(o: Options): { file: RunsFile; summary: Summary } {
       dist: Math.round(animatedDist),
       ...(c.act.dist !== null ? { csvDist: Math.round(c.act.dist) } : {}),
       dur: Math.round(tr.t[tr.t.length - 1]),
-      // with privacy trimming the original start distance would help locate home, so leave it out
-      ...(o.privacyRadius > 0 ? {} : { sd: Math.round(c.startDist) }),
       p: encodePath(tr.lon, tr.lat, tr.t, ref, SCALE),
     });
   }
-  if (!runs.length) {
-    throw new UsageError(`no runs start within ${o.radius} m of home (${home[0].toFixed(3)}, ${home[1].toFixed(3)}); `
-      + 'try a larger --radius or a different --home');
+  if (o.privacyRadius > 0) {
+    homes = homes.map((h) => ({ ...h, lat: Math.round(h.lat * 100) / 100, lon: Math.round(h.lon * 100) / 100 }));
   }
+  if (!runs.length) throw new UsageError('no runs left after --privacy-radius trimming');
   runs.sort((a, b) => a.date.localeCompare(b.date));
 
   const file: RunsFile = {
-    version: 1,
+    version: 2,
     generatedAt: new Date().toISOString(),
     scale: SCALE,
     ref,
     meta: {
-      radius: o.radius, privacyTrimmed: o.privacyRadius > 0, maxSpeed: o.maxSpeed, sport: o.sport,
+      // trimmed starts lie around the privacy circle and homes are rounded, so filter more loosely
+      radius: o.privacyRadius > 0 ? Math.ceil((o.radius + o.privacyRadius + 1000) / 100) * 100 : o.radius,
+      privacyTrimmed: o.privacyRadius > 0, homes, maxSpeed: o.maxSpeed, sport: o.sport,
       since: o.since, until: o.until,
     },
     runs,
@@ -289,7 +309,7 @@ export function runIngest(o: Options): { file: RunsFile; summary: Summary } {
   return {
     file,
     summary: {
-      input: o.input, fromCsv, activities: list.length, read, parsed, home, homeFromOption: !!o.home,
+      input: o.input, fromCsv, activities: list.length, read, parsed, homes,
       kept: runs.length, cutAtSignalLoss, truncated, points,
       years: [runs[0].date.slice(0, 4), runs[runs.length - 1].date.slice(0, 4)],
       skipped: [...skipped].sort((a, b) => b[1] - a[1]),
@@ -321,8 +341,10 @@ export function formatSummary(s: Summary, radius: number, out: string, bytes: nu
     `activities:    ${s.activities}`,
     `files read:    ${s.read}`,
     `parsed:        ${s.parsed}`,
-    `home:          ${s.home[0].toFixed(4)}, ${s.home[1].toFixed(4)} ${s.homeFromOption ? '(--home)' : `(densest start cluster, ${radius} m)`}`,
-    `runs kept:     ${s.kept}${s.years ? ` (${s.years[0]}-${s.years[1]})` : ''}`,
+    `runs kept:     ${s.kept} with GPS${s.years ? ` (${s.years[0]}-${s.years[1]})` : ''}`,
+    `homes:         ${s.homes.length} (places with runs starting within ${radius} m)`,
+    ...s.homes.map((h, i) => `  ${String(i + 1).padStart(3)}. ${h.lat.toFixed(4)}, ${h.lon.toFixed(4)} · ${h.runs} runs · `
+      + `${h.first === h.last ? h.first : `${h.first}-${h.last}`}${h.fromOption ? ' (--home)' : ''}`),
     `cut at signal loss: ${s.cutAtSignalLoss} of the kept runs`,
     ...(s.truncated ? [`truncated:     ${s.truncated} files (partial data kept)`] : []),
     `points:        ${s.points}`,

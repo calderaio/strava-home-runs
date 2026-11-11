@@ -13,20 +13,31 @@ export interface RunRecord {
   dist: number;   // metres of the animated (cleaned) track
   csvDist?: number; // distance Strava reports in activities.csv, metres
   dur: number;    // animated duration in seconds (after pause shortening)
-  /** distance of the original start from home, metres; omitted when the ends were privacy-trimmed */
-  sd?: number;
   p: number[];
 }
 
+/** A place many runs start from. */
+export interface HomeCandidate {
+  lat: number;
+  lon: number;
+  runs: number;     // runs that start within meta.radius
+  first: number;    // first and last year of those runs
+  last: number;
+  fromOption?: boolean; // given with --home
+}
+
 export interface RunsFile {
-  version: 1;
+  version: 2;
   generatedAt: string;
   scale: number;
   ref: [number, number]; // lon, lat
   meta: {
+    /** default start radius for the page, metres */
     radius: number;
-    /** true when the track ends near home were trimmed; the radius itself is not stored */
+    /** true when track ends near every home were trimmed; homes are then rounded to ~1 km */
     privacyTrimmed: boolean;
+    /** home candidates, densest first (or the --home one first) */
+    homes: HomeCandidate[];
     maxSpeed: number;
     sport: string;
     since: string | null;

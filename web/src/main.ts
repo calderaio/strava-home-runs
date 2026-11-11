@@ -4,8 +4,9 @@ import { Map as MlMap } from 'maplibre-gl';
 import { MapboxOverlay } from '@deck.gl/mapbox';
 import { TripsLayer } from '@deck.gl/geo-layers';
 import { ScatterplotLayer } from '@deck.gl/layers';
-import type { RunsFile } from './lib/format.ts';
-import { decodeRuns, filterRuns, headAt, type Run } from './lib/runs.ts';
+import type { HomeCandidate, RunsFile } from './lib/format.ts';
+import { decodeRuns, filterRuns, headAt, homeRange, trimAround, type Home, type Run } from './lib/runs.ts';
+import { candidateId, customId, loadPrefs, savePrefs, type Prefs } from './lib/prefs.ts';
 import { FPS, makeWarp, runTime, totalFrames, type WarpParams } from './lib/timewarp.ts';
 import { cameraAt, computeCameraTrack, type CameraTrack, type ViewBox } from './lib/camera.ts';
 import { BAND, buildHud, defaultTitles, drawHud, formatClock, type HudFrame, type HudModel } from './lib/hud.ts';
@@ -51,6 +52,15 @@ const el = {
   radiusVal: $<HTMLSpanElement>('radius-val'),
   radiusNote: $<HTMLParagraphElement>('radius-note'),
   privacy: $<HTMLParagraphElement>('privacy'),
+  home: $<HTMLSelectElement>('home'),
+  homeName: $<HTMLInputElement>('home-name'),
+  pick: $<HTMLButtonElement>('pick'),
+  pickCancel: $<HTMLButtonElement>('pick-cancel'),
+  forget: $<HTMLButtonElement>('forget'),
+  pickStatus: $<HTMLParagraphElement>('pick-status'),
+  homeNote: $<HTMLParagraphElement>('home-note'),
+  privacyRadius: $<HTMLInputElement>('privacy-radius'),
+  privacyVal: $<HTMLSpanElement>('privacy-val'),
   mapStatus: $<HTMLParagraphElement>('map-status'),
   count: $<HTMLParagraphElement>('count'),
   strength: $<HTMLInputElement>('strength'),
@@ -84,7 +94,40 @@ const state = {
   dirty: true,
   scale: 1,
   trailColor: [...TRAIL_RGB, 30] as [number, number, number, number],
+  candidates: [] as HomeCandidate[],
+  approxHomes: false,   // privacy-trimmed file: starts and homes are approximate
+  defaultRadius: 200,
+  prefs: loadPrefs() as Prefs,
+  homeId: '',
+  picking: false,
+  cursor: null as Home | null,
 };
+
+interface HomeEntry { id: string; lat: number; lon: number; label: string; custom: boolean }
+
+/** Candidate homes from the file, then homes picked on the map. */
+function homeEntries(): HomeEntry[] {
+  const r = state.defaultRadius;
+  const cands = state.candidates.map((h, i) => {
+    const id = candidateId(h.lat, h.lon);
+    const name = state.prefs.names[id] || `Home ${i + 1}`;
+    const years = h.first === h.last ? `${h.first}` : `${h.first}–${h.last}`;
+    return { id, lat: h.lat, lon: h.lon, custom: false, label: `${name} · ${h.runs} runs · ${years}${h.fromOption ? ' · --home' : ''}` };
+  });
+  const custom = state.prefs.custom.map((c, i) => {
+    const name = state.prefs.names[c.id] || `Picked home ${i + 1}`;
+    const rg = homeRange(state.all, c, r);
+    const years = rg.count ? (rg.first.slice(0, 4) === rg.last.slice(0, 4) ? rg.first.slice(0, 4) : `${rg.first.slice(0, 4)}–${rg.last.slice(0, 4)}`) : 'no runs';
+    return { id: c.id, lat: c.lat, lon: c.lon, custom: true, label: `${name} · ${rg.count} runs · ${years}` };
+  });
+  return [...cands, ...custom];
+}
+
+const currentHome = (): HomeEntry | undefined => homeEntries().find((h) => h.id === state.homeId);
+
+function persist() {
+  if (!savePrefs(state.prefs)) el.homeNote.textContent = 'Home names and picks cannot be saved in this browser (storage is blocked); they last until you reload.';
+}
 
 // ---------------------------------------------------------------- map
 
@@ -93,7 +136,12 @@ const map = new MlMap({
   style: STYLE,
   center: [8.23, 46.8], // all of Switzerland until the runs are loaded; the camera then fits the data
   zoom: 6,
-  interactive: false,
+  interactive: true, // only used while picking a home; the handlers are switched off below
+  dragRotate: false,
+  pitchWithRotate: false,
+  touchPitch: false,
+  boxZoom: false,
+  keyboard: false,
   attributionControl: false,
   // No label fade: with fadeDuration 0 MapLibre also places all labels in full on every frame, so
   // what a frame shows depends only on the camera and the loaded tiles, not on wall-clock time.
@@ -102,6 +150,9 @@ const map = new MlMap({
   pixelRatio: 1,
   canvasContextAttributes: { antialias: true, preserveDrawingBuffer: true },
 });
+const handlers = [map.dragPan, map.scrollZoom, map.doubleClickZoom, map.touchZoomRotate];
+const setMapInteractive = (on: boolean) => { for (const h of handlers) (on ? h.enable() : h.disable()); };
+setMapInteractive(false);
 const overlay = new MapboxOverlay({ interleaved: true, layers: [] });
 map.addControl(overlay);
 let beforeId: string | undefined;
@@ -135,6 +186,8 @@ map.on('error', (e) => {
   const msg = ev.error?.message ?? String(e);
   if (ev.tile || ev.sourceId) {
     mapHealth.tileErrors++;
+    const c = (ev.tile as TileLike | undefined)?.tileID?.canonical;
+    if (c && ev.sourceId) failedTiles.set(`${ev.sourceId}/${c.z}/${c.x}/${c.y}`, { source: ev.sourceId, z: c.z, x: c.x, y: c.y });
     mapHealth.lastError = msg;
     setMapStatus(`${mapHealth.tileErrors} map tile request${mapHealth.tileErrors === 1 ? '' : 's'} failed (${msg}). `
       + 'The basemap has gaps; check the network connection. Exports list the affected frames.');
@@ -163,6 +216,34 @@ map.on('style.load', () => {
 });
 
 type TileLike = { state: string; tileID: { canonical: { x: number; y: number; z: number } } };
+
+/** Tiles whose request failed and that have not loaded since. */
+const failedTiles = new Map<string, { source: string; z: number; x: number; y: number }>();
+map.on('sourcedata', (e) => {
+  const ev = e as unknown as { sourceId?: string; tile?: TileLike };
+  const c = ev.tile?.tileID?.canonical;
+  if (c && ev.sourceId && ev.tile?.state === 'loaded') failedTiles.delete(`${ev.sourceId}/${c.z}/${c.x}/${c.y}`);
+});
+
+/** Failed tiles at the zoom the map currently draws that overlap the current view, per source. */
+function failedTilesInView(): Map<string, { x: number; y: number; z: number }[]> {
+  const out = new Map<string, { x: number; y: number; z: number }[]>();
+  if (!failedTiles.size) return out;
+  const b = map.getBounds();
+  const zIdeal = Math.floor(map.getZoom());
+  const lonOfX = (x: number, z: number) => (x / 2 ** z) * 360 - 180;
+  const latOfY = (y: number, z: number) => (Math.atan(Math.sinh(Math.PI * (1 - (2 * y) / 2 ** z))) * 180) / Math.PI;
+  for (const t of failedTiles.values()) {
+    // the source's max zoom caps the ideal zoom, so also accept the deepest tiles below it
+    if (t.z > zIdeal || t.z < Math.min(zIdeal, 15) - 1) continue;
+    const w = lonOfX(t.x, t.z), e = lonOfX(t.x + 1, t.z), n = latOfY(t.y, t.z), s = latOfY(t.y + 1, t.z);
+    if (e < b.getWest() || w > b.getEast() || n < b.getSouth() || s > b.getNorth()) continue;
+    const list = out.get(t.source) ?? [];
+    list.push({ x: t.x, y: t.y, z: t.z });
+    out.set(t.source, list);
+  }
+  return out;
+}
 /** Tiles in view whose request failed, per source (reads MapLibre's tile managers; empty if that changes). */
 function erroredTiles(): Map<string, { x: number; y: number; z: number }[]> {
   const out = new Map<string, { x: number; y: number; z: number }[]>();
@@ -247,6 +328,7 @@ async function completeMapFrame(signal?: AbortSignal): Promise<boolean> {
     const idle = await waitForMap(signal);
     if (signal?.aborted) return false;
     const errored = erroredTiles();
+    for (const [id, tiles] of failedTilesInView()) errored.set(id, [...(errored.get(id) ?? []), ...tiles]);
     if (idle && mapHealth.tileErrors === errorsBefore && !errored.size) return true;
     if (attempt === 0) for (const [id, tiles] of errored) map.refreshTiles(id, tiles);
   }
@@ -261,9 +343,16 @@ function autoStrength(n: number) {
 
 function rebuild() {
   if (state.exporting) return; // the export renders from a frozen model
-  const runs = filterRuns(state.all, { from: el.from.value || '0000', to: el.to.value || '9999', maxStart: Number(el.radius.value) });
+  const home = currentHome();
+  if (!home) return;
+  const privacy = Number(el.privacyRadius.value);
+  const starting = filterRuns(state.all, { from: el.from.value || '0000', to: el.to.value || '9999', maxStart: Number(el.radius.value), home });
+  // page-side privacy: trim the ends near the chosen home before anything is drawn
+  const runs = starting.map((r) => trimAround(r, home, privacy)).filter((r): r is Run => r !== null);
   el.radiusVal.textContent = `${el.radius.value} m`;
-  el.count.textContent = `${runs.length} of ${state.all.length} runs`;
+  el.privacyVal.textContent = `${privacy} m`;
+  el.count.textContent = `${runs.length} of ${state.all.length} runs start within ${el.radius.value} m of this home`
+    + (starting.length > runs.length ? ` (${starting.length - runs.length} lie entirely inside the privacy radius)` : '');
   if (!runs.length) {
     state.model = null;
     overlay.setProps({ layers: [] });
@@ -280,7 +369,7 @@ function rebuild() {
   const warp = makeWarp(tmax, seconds);
   const total = totalFrames(warp);
   const clock = Float64Array.from({ length: total }, (_, f) => runTime(f, warp));
-  const titles = defaultTitles(runs);
+  const titles = defaultTitles(runs, state.prefs.names[home.id] ?? '');
   el.title.placeholder = titles.title;
   el.subtitle.placeholder = titles.subtitle;
   state.model = {
@@ -375,7 +464,10 @@ function tick(now: number) {
   const dt = Math.min(0.1, (now - last) / 1000);
   last = now;
   const m = state.model;
-  if (m && !state.exporting) {
+  if (state.picking && !state.exporting) {
+    if (state.dirty) renderPicking();
+    state.dirty = false;
+  } else if (m && !state.exporting) {
     if (state.playing) {
       state.frame += dt * FPS * Number(el.speed.value);
       if (state.frame >= m.total - 1) {
@@ -415,6 +507,7 @@ export interface ExportOutcome extends ExportResult {
 
 /** Inputs that would change the model; locked while an export renders. */
 const lockable = () => [el.from, el.to, el.radius, el.seconds, el.title, el.subtitle, el.strength, el.size, el.limit,
+  el.home, el.homeName, el.pick, el.forget, el.privacyRadius,
   el.file, el.speed, el.play, el.replay, el.scrub, el.export];
 
 // Read frames back through a separate canvas, so hashing never touches the export canvas itself
@@ -464,6 +557,7 @@ async function runExport(req: ExportRequest = {}): Promise<ExportOutcome> {
   if (!m) throw new Error('no runs loaded');
   if (document.hidden) throw new Error('the tab is hidden; keep it visible to export');
   if (!styleLoaded) throw new Error('the basemap has not loaded yet');
+  if (state.picking) stopPicking();
   const trailColor = state.trailColor;
   const [selW, selH] = el.size.value.split('x').map(Number);
   const W = req.width ?? selW;
@@ -571,7 +665,6 @@ async function runExport(req: ExportRequest = {}): Promise<ExportOutcome> {
     applyPixelRatio(livePixelRatio());
     for (const i of locked) i.disabled = false;
     setControlsEnabled(!!state.model);
-    el.radius.disabled = state.all.some((r) => r.sd === null);
     el.cancel.hidden = true;
     el.progress.hidden = true;
     state.dirty = true;
@@ -604,27 +697,133 @@ function setControlsEnabled(on: boolean) {
 }
 
 function useData(file: RunsFile) {
-  state.all = decodeRuns(file);
-  if (!state.all.length) throw new Error('the runs file has no runs');
+  const all = decodeRuns(file);
+  if (!all.length) throw new Error('the runs file has no runs');
+  if (!Array.isArray(file.meta?.homes) || !file.meta.homes.length) throw new Error('the runs file lists no homes');
+  state.all = all;
+  state.candidates = file.meta.homes;
+  state.approxHomes = !!file.meta.privacyTrimmed;
+  state.defaultRadius = Math.max(5, Math.ceil(file.meta.radius / 5) * 5);
   const days = state.all.map((r) => r.day).sort();
   for (const i of [el.from, el.to]) { i.min = days[0]; i.max = days[days.length - 1]; }
-  el.from.value = days[0];
-  el.to.value = days[days.length - 1];
-  const maxR = Math.max(1, Math.ceil(file.meta.radius));
-  el.radius.max = String(maxR);
-  el.radius.value = String(maxR);
-  const trimmed = file.meta.privacyTrimmed || state.all.some((r) => r.sd === null);
-  el.radius.disabled = trimmed; // privacy-trimmed files carry no start distances
-  el.radiusNote.textContent = trimmed ? 'Not available: the ends of these tracks were privacy-trimmed.' : '';
-  el.privacy.textContent = trimmed
-    ? 'The track ends near home were trimmed. With many runs, home can still be estimated from where the trimmed tracks begin and end, to within about a metre.'
-    : 'Every run starts at home, so the map and the video show where you live. Ingest with --privacy-radius to trim the ends (this hides less than it seems with many runs).';
+  el.radius.max = String(Math.max(2000, state.defaultRadius));
+  el.radius.value = String(state.defaultRadius);
+  el.privacyRadius.value = String(state.prefs.privacyRadius);
+  el.radiusNote.textContent = state.approxHomes
+    ? 'Approximate: this file was trimmed around every home at ingest and its homes are rounded to about 1 km, so starts are only roughly where the runs began.'
+    : '';
+  el.privacy.textContent = state.approxHomes
+    ? 'The track ends near every home were trimmed when the file was made, and the homes in it are rounded. With many runs, a home can still be estimated from where the trimmed tracks begin and end.'
+    : 'Every run starts at home, so the map and the video show where you live. The data file also lists every place you have run from often, so it shows where you have lived; it stays on this computer. Hiding the ends near home helps less than it seems: with many runs, home can still be found to within about a metre from where the tracks begin and end.';
   el.strength.value = String(autoStrength(state.all.length));
   updateStrength();
   el.load.hidden = true;
+  fillHomes();
+  const ids = homeEntries().map((h) => h.id);
+  selectHome(state.prefs.selected && ids.includes(state.prefs.selected) ? state.prefs.selected : ids[0]);
+}
+
+function fillHomes() {
+  el.home.replaceChildren(...homeEntries().map((h) => new Option(h.label, h.id)), new Option('Pick on map…', 'pick'));
+  el.home.value = state.homeId;
+}
+
+/** Switch home: date range, name field and the model follow it. */
+function selectHome(id: string) {
+  const h = homeEntries().find((e) => e.id === id);
+  if (!h) return;
+  state.homeId = id;
+  state.prefs.selected = id;
+  persist();
+  el.home.value = id;
+  el.homeName.value = state.prefs.names[id] ?? '';
+  el.forget.hidden = !h.custom;
+  const rg = homeRange(state.all, h, Number(el.radius.value));
+  el.from.value = rg.first || el.from.min;
+  el.to.value = rg.last || el.to.max;
+  el.homeNote.textContent = rg.count ? '' : 'No runs start near this home yet; try a larger radius.';
   state.frame = 0;
+  setPlaying(false);
   rebuild();
 }
+
+// ---------------------------------------------------------------- picking a home on the map
+
+function startPicking() {
+  if (!state.all.length || state.exporting) return;
+  state.picking = true;
+  setPlaying(false);
+  setMapInteractive(true);
+  el.pick.hidden = true;
+  el.pickCancel.hidden = false;
+  el.pickStatus.textContent = 'Click the map where the runs start. Drag to pan, scroll to zoom.';
+  clearHud();
+  el.stage.classList.add('picking');
+  state.dirty = true;
+}
+
+function stopPicking() {
+  state.picking = false;
+  state.cursor = null;
+  setMapInteractive(false);
+  el.pick.hidden = false;
+  el.pickCancel.hidden = true;
+  el.pickStatus.textContent = '';
+  el.stage.classList.remove('picking');
+  el.home.value = state.homeId;
+  state.dirty = true;
+}
+
+/** All runs, fully drawn, plus a circle of the start radius at the cursor and the known homes. */
+function renderPicking() {
+  const r = Number(el.radius.value);
+  const homes = homeEntries();
+  overlay.setProps({
+    layers: [
+      new TripsLayer<Run, { beforeId?: string }>({
+        id: 'trails', data: state.all, beforeId, getPath: (d) => d.lonlat, positionFormat: 'XY', _pathType: 'open',
+        getTimestamps: (d) => d.t, getColor: state.trailColor, getWidth: 1.5, widthUnits: 'pixels', widthMinPixels: 1,
+        currentTime: 1e9, trailLength: 1e10, fadeTrail: false, parameters: ADDITIVE,
+      }),
+      new ScatterplotLayer<HomeEntry>({
+        id: 'homes', data: homes, getPosition: (h) => [h.lon, h.lat], getRadius: 5, radiusUnits: 'pixels',
+        getFillColor: (h) => (h.id === state.homeId ? [255, 255, 255, 255] : [255, 196, 150, 220]),
+        parameters: { depthCompare: 'always', depthWriteEnabled: false },
+      }),
+      new ScatterplotLayer<Home>({
+        id: 'cursor', data: state.cursor ? [state.cursor] : [], getPosition: (h) => [h.lon, h.lat], getRadius: r,
+        radiusUnits: 'meters', stroked: true, filled: true, getFillColor: [255, 255, 255, 30], getLineColor: [255, 255, 255, 200],
+        lineWidthUnits: 'pixels', getLineWidth: 1.5, parameters: { depthCompare: 'always', depthWriteEnabled: false },
+      }),
+    ],
+  });
+}
+
+function previewCount(h: Home): string {
+  const r = Number(el.radius.value);
+  const rg = homeRange(state.all, h, r);
+  const years = rg.count ? ` (${rg.first.slice(0, 4)}–${rg.last.slice(0, 4)})` : '';
+  return `${rg.count} runs start within ${r} m here${years}${state.approxHomes ? ' — approximate, the file was privacy-trimmed' : ''}. Click to use it.`;
+}
+
+map.on('mousemove', (e) => {
+  if (!state.picking) return;
+  state.cursor = { lat: e.lngLat.lat, lon: e.lngLat.lng };
+  el.pickStatus.textContent = previewCount(state.cursor);
+  state.dirty = true;
+});
+
+map.on('click', (e) => {
+  if (!state.picking) return;
+  const lat = Math.round(e.lngLat.lat * 1e5) / 1e5;
+  const lon = Math.round(e.lngLat.lng * 1e5) / 1e5;
+  const id = customId(lat, lon);
+  if (!state.prefs.custom.some((c) => c.id === id)) state.prefs.custom.push({ id, lat, lon });
+  persist();
+  stopPicking();
+  fillHomes();
+  selectHome(id);
+});
 
 /** Load data/runs.json, independently of the basemap, and say exactly what went wrong if it fails. */
 async function loadDefault() {
@@ -672,7 +871,34 @@ el.play.onclick = () => {
 el.replay.onclick = () => { state.frame = 0; setPlaying(true); state.dirty = true; };
 el.scrub.oninput = () => { state.frame = Number(el.scrub.value); state.dirty = true; };
 for (const i of [el.from, el.to, el.seconds]) i.onchange = rebuild;
-el.radius.oninput = () => { el.radiusVal.textContent = `${el.radius.value} m`; rebuildSoon(); };
+el.radius.oninput = () => {
+  el.radiusVal.textContent = `${el.radius.value} m`;
+  if (state.picking) { if (state.cursor) el.pickStatus.textContent = previewCount(state.cursor); state.dirty = true; return; }
+  rebuildSoon();
+};
+el.privacyRadius.oninput = () => {
+  el.privacyVal.textContent = `${el.privacyRadius.value} m`;
+  state.prefs.privacyRadius = Number(el.privacyRadius.value);
+  persist();
+  rebuildSoon();
+};
+el.home.onchange = () => { if (el.home.value === 'pick') startPicking(); else selectHome(el.home.value); };
+el.pick.onclick = startPicking;
+el.pickCancel.onclick = stopPicking;
+el.homeName.oninput = () => {
+  const name = el.homeName.value.trim();
+  if (name) state.prefs.names[state.homeId] = name; else delete state.prefs.names[state.homeId];
+  persist();
+  fillHomes();
+  rebuildSoon();
+};
+el.forget.onclick = () => {
+  state.prefs.custom = state.prefs.custom.filter((c) => c.id !== state.homeId);
+  delete state.prefs.names[state.homeId];
+  persist();
+  fillHomes();
+  selectHome(homeEntries()[0].id);
+};
 el.strength.oninput = updateStrength;
 el.title.oninput = el.subtitle.oninput = rebuildSoon;
 el.export.onclick = () => { runExport().catch((e) => console.warn('export:', (e as Error).message)); };
@@ -683,6 +909,7 @@ el.file.onchange = async () => {
   try { useData(JSON.parse(await f.text())); } catch (e) { showText(`Could not read ${f.name}: ${(e as Error).message}`); }
 };
 window.addEventListener('keydown', (e) => {
+  if (e.code === 'Escape' && state.picking) stopPicking();
   if (e.code === 'Space' && !(e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement)) {
     e.preventDefault();
     el.play.click();

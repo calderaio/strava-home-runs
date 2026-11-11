@@ -40,14 +40,16 @@ export function histScale(tmax: number): [number, [number, string][]] {
   return [5, range(60).map((m) => [m, `${m / 60}h`])];
 }
 
-export function defaultTitles(runs: Run[]): { title: string; subtitle: string } {
+/** Title and subtitle like the Python tool; `place` (the home's name) is appended like --place. */
+export function defaultTitles(runs: Run[], place = ''): { title: string; subtitle: string } {
   const years = [...new Set(runs.map((r) => r.year))].sort((a, b) => a - b);
   if (!years.length) return { title: 'HOME RUNS', subtitle: 'no runs' };
   const one = years.length === 1;
   const n = runs.length;
   return {
     title: one ? `HOME RUNS ${years[0]}` : `HOME RUNS since ${years[0]}`,
-    subtitle: `${n} run${n === 1 ? '' : 's'} ` + (one ? `in ${years[0]}` : `between ${years[0]} and ${years[years.length - 1]}`),
+    subtitle: `${n} run${n === 1 ? '' : 's'} ` + (one ? `in ${years[0]}` : `between ${years[0]} and ${years[years.length - 1]}`)
+      + (place.trim() ? `, ${place.trim()}` : ''),
   };
 }
 

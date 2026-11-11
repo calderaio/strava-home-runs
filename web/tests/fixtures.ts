@@ -34,8 +34,8 @@ export function line(n: number, t0: number, speed = 3, start: [number, number] =
 
 /** A decoded run for client-side tests. */
 export const run = (lonlat: number[], t: number[], extra: Partial<Run> = {}): Run => ({
-  id: 'x', name: 'x', date: new Date(0), day: '2024-05-01', year: 2024, dist: 0, dur: t[t.length - 1], sd: 0,
-  lonlat: Float64Array.from(lonlat), t: Float32Array.from(t), ...extra,
+  id: 'x', name: 'x', date: new Date(0), day: '2024-05-01', year: 2024, dist: 0, dur: t[t.length - 1],
+  start: [lonlat[0], lonlat[1]], lonlat: Float64Array.from(lonlat), t: Float32Array.from(t), ...extra,
 });
 
 // ---------------------------------------------------------------- FIT
