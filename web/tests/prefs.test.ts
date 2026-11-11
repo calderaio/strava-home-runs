@@ -32,6 +32,18 @@ describe('preferences', () => {
     expect(dataPrefs(p, 'runs:A').custom.length).toBe(1);
   });
 
+  test('a re-ingest (new fingerprint) of the same export takes over the old choices; another export does not', () => {
+    const p = defaultPrefs();
+    const old = dataPrefs(p, 'runs:A', ['h:1', 'h:2']);
+    old.selected = 'h:2';
+    old.custom.push({ id: 'u:1', lat: 1, lon: 2 });
+    const again = dataPrefs(p, 'runs:B', ['h:2', 'h:3']); // --since dropped home h:1, h:2 is still there
+    expect(again).toEqual({ selected: 'h:2', custom: [{ id: 'u:1', lat: 1, lon: 2 }] });
+    again.custom.push({ id: 'u:2', lat: 3, lon: 4 });
+    expect(p.data['runs:A'].custom.length).toBe(1); // a copy, not shared
+    expect(dataPrefs(p, 'runs:C', ['h:9'])).toEqual({ selected: null, custom: [] });
+  });
+
   test('a throwing or missing storage falls back to defaults and reports that it could not save', () => {
     expect(loadPrefs(broken)).toEqual(defaultPrefs());
     expect(savePrefs(defaultPrefs(), broken)).toBe(false);

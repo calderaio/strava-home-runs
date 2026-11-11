@@ -117,7 +117,7 @@ interface HomeEntry {
 }
 
 const yearsOf = (first: number | string, last: number | string) => (String(first) === String(last) ? `${first}` : `${first}–${last}`);
-const prefsForData = () => dataPrefs(state.prefs, state.fingerprint);
+const prefsForData = () => dataPrefs(state.prefs, state.fingerprint, state.candidates.map((h) => h.id));
 
 /** Candidate homes from the file (homes and nearby start spots), then homes picked on the map. */
 function homeEntries(): HomeEntry[] {
@@ -192,7 +192,7 @@ const mapLoaded = new Promise<void>((resolve) => {
   });
 });
 /** Failed tile requests, counted so the export can flag frames with gaps in the basemap. */
-const mapHealth = { tileErrors: 0, lastError: '', fontFallback: false };
+const mapHealth = { tileErrors: 0, tilesLoaded: 0, lastError: '', fontFallback: false };
 // When the label fonts (glyph .pbf files) fail to load, MapLibre draws labels with a local fallback
 // font and only logs a warning, so listen for that warning to be able to report it.
 const consoleWarn = console.warn.bind(console);
@@ -238,15 +238,45 @@ map.on('style.load', () => {
 
 type TileLike = { state: string; tileID: { canonical: { x: number; y: number; z: number } } };
 
+/** A tile that has data to draw; 'expired' means loaded but past its cache lifetime, still drawn. */
+const hasData = (state?: string) => state === 'loaded' || state === 'expired';
+
 /** Tiles whose request failed and that have not loaded since. */
 const failedTiles = new TileFailures();
 map.on('sourcedata', (e) => {
   const ev = e as unknown as { sourceId?: string; tile?: TileLike };
   const c = ev.tile?.tileID?.canonical;
-  if (c && ev.sourceId && ev.tile?.state === 'loaded' && failedTiles.loaded(ev.sourceId, c)) updateTileStatus();
+  if (!c || !ev.sourceId || !hasData(ev.tile?.state)) return;
+  mapHealth.tilesLoaded++;
+  if (failedTiles.loaded(ev.sourceId, c)) updateTileStatus();
 });
 
+/**
+ * Forget failures of tiles that MapLibre now holds as loaded (a tile can load again, e.g. from its
+ * cache or a later reload, without the failure being cleared), so they aren't reported as gaps.
+ */
+function pruneRecoveredTiles() {
+  if (!failedTiles.size) return;
+  const tms = (map as unknown as { style?: { tileManagers?: Record<string, { _inViewTiles?: { getAllTiles(): TileLike[] } }> } })
+    .style?.tileManagers ?? {};
+  let changed = false;
+  for (const [id, tm] of Object.entries(tms)) {
+    for (const t of tm._inViewTiles?.getAllTiles() ?? []) {
+      if (hasData(t.state) && failedTiles.loaded(id, t.tileID.canonical)) changed = true;
+    }
+  }
+  if (changed) updateTileStatus();
+}
+
 map.on('idle', () => updateTileStatus());
+// MapLibre doesn't request a failed tile again by itself; retry the ones in view now and then, so the
+// live map (and its status line) recovers once the network is back
+setInterval(() => {
+  if (state.exporting || document.hidden) return;
+  // a failed tile may already be dropped from the tile cache, so reload the whole source
+  for (const id of failedTilesInView().keys()) map.refreshTiles(id);
+  updateTileStatus(); // the view may have moved on from the failed tiles
+}, 15000);
 /** The map status line follows the tiles that are failing right now and clears once they load. */
 function updateTileStatus() {
   let n = 0;
@@ -349,10 +379,12 @@ async function completeMapFrame(signal?: AbortSignal): Promise<boolean> {
     const errorsBefore = mapHealth.tileErrors;
     const idle = await waitForMap(signal);
     if (signal?.aborted) return false;
+    pruneRecoveredTiles();
     const errored = erroredTiles();
     for (const [id, tiles] of failedTilesInView()) errored.set(id, [...(errored.get(id) ?? []), ...tiles]);
     if (idle && mapHealth.tileErrors === errorsBefore && !errored.size) return true;
-    if (attempt === 0) for (const [id, tiles] of errored) map.refreshTiles(id, tiles);
+    // request the failed tiles again; one that was dropped from the tile cache needs a source reload
+    if (attempt === 0) for (const id of errored.keys()) map.refreshTiles(id);
   }
   return false;
 }
@@ -612,12 +644,16 @@ async function runExport(req: ExportRequest = {}): Promise<ExportOutcome> {
   el.exportStatus.textContent = `Rendering ${frames} frames at ${W} × ${H}…`;
   const incomplete: number[] = [];
   const stall = stallGuard();
+  const failing = { frames: 0, loadsBefore: 0 }; // frames in a row with gaps, and tile loads when that began
   const hashes: string[] = [];
   const pngs: Record<number, string> = {};
   const t0 = performance.now();
   try {
     applyPixelRatio(W / STAGE_W);
-    await waitForMap(ac.signal);
+    // start from the first frame's view with every tile that failed earlier requested again, so
+    // failures from before the export (since recovered) aren't counted as gaps
+    setFrame(0, false, m, trailColor);
+    await completeMapFrame(ac.signal);
     const res = await exportVideo({
       width: W,
       height: H,
@@ -627,7 +663,17 @@ async function runExport(req: ExportRequest = {}): Promise<ExportOutcome> {
       draw: async (f, ctx) => {
         const tf = performance.now();
         setFrame(f, false, m, trailColor);
-        if (!(await completeMapFrame(ac.signal)) && !ac.signal.aborted) incomplete.push(f);
+        if (!(await completeMapFrame(ac.signal)) && !ac.signal.aborted) {
+          incomplete.push(f);
+          if (!failing.frames) failing.loadsBefore = mapHealth.tilesLoaded;
+          failing.frames++;
+          if (failing.frames >= 5 && mapHealth.tilesLoaded === failing.loadsBefore) {
+            throw new StallError(`the basemap isn't loading: ${failing.frames} frames in a row have failed map tiles and no tile `
+              + `has loaded meanwhile${mapHealth.lastError ? ` (${mapHealth.lastError})` : ''}. Check the network connection and export again.`);
+          }
+        } else {
+          failing.frames = 0;
+        }
         // Once everything is loaded, render the frame once more from scratch: MapLibre's label placement
         // can still depend on the order in which tiles arrived, and a fresh full placement on a complete
         // tile set evens that out.

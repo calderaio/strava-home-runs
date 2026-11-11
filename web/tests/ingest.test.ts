@@ -147,6 +147,21 @@ describe('ingest', () => {
     }
   });
 
+  test('a privacy file never puts --home coordinates into a home id (or anywhere else)', () => {
+    const [lat, lon] = offset(37, 21);
+    const { file } = runIngest(opts(['--privacy-radius', '300', '--home', `${lat},${lon}`]));
+    const [h] = file.meta.homes;
+    expect(h.fromOption).toBe(true);
+    for (const home of file.meta.homes) expect(home.id).toMatch(/^h:[^:,]+$/); // h:<run id>, no coordinates
+    const json = JSON.stringify(file);
+    for (const v of [lat, lon]) {
+      expect(json).not.toContain(String(v));
+      expect(json).not.toContain(v.toFixed(4));
+      expect(json).not.toContain(v.toFixed(3));
+    }
+    expect(h.lat).toBe(Math.round(lat * 100) / 100); // only the rounded value is stored
+  });
+
   test('main(): writes the file, prints the summary, exits 0', () => {
     const log = spyOn(console, 'log').mockImplementation(() => {});
     try {

@@ -23,9 +23,18 @@ export const PREFS_KEY = 'home-runs.prefs.v2';
 
 export const defaultPrefs = (): Prefs => ({ names: {}, radii: {}, data: {}, privacyRadius: 0 });
 
-/** The selection and picked homes for one data file, created on first use. */
-export function dataPrefs(p: Prefs, fingerprint: string): DataPrefs {
-  return (p.data[fingerprint] ??= { selected: null, custom: [] });
+/**
+ * The selection and picked homes for one data file, created on first use. A re-ingest of the same
+ * export (e.g. with --since) changes the fingerprint; then an entry whose selected home is one of
+ * this file's homes (`homeIds`) is taken over, so the choices survive.
+ */
+export function dataPrefs(p: Prefs, fingerprint: string, homeIds: string[] = []): DataPrefs {
+  if (!p.data[fingerprint]) {
+    const ids = new Set(homeIds);
+    const prior = Object.values(p.data).find((d) => d.selected !== null && ids.has(d.selected));
+    p.data[fingerprint] = prior ? { selected: prior.selected, custom: prior.custom.map((c) => ({ ...c })) } : { selected: null, custom: [] };
+  }
+  return p.data[fingerprint];
 }
 
 type StorageLike = Pick<Storage, 'getItem' | 'setItem'>;
