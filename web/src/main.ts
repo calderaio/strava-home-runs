@@ -6,7 +6,9 @@ import { TripsLayer } from '@deck.gl/geo-layers';
 import { ScatterplotLayer } from '@deck.gl/layers';
 import type { HomeCandidate, RunsFile } from './lib/format.ts';
 import { decodeRuns, filterRuns, headAt, homeRange, trimAround, type Home, type Run } from './lib/runs.ts';
-import { candidateId, customId, loadPrefs, savePrefs, type Prefs } from './lib/prefs.ts';
+import { customId, dataPrefs, loadPrefs, savePrefs, type Prefs } from './lib/prefs.ts';
+import { groupHomes } from './lib/homes.ts';
+import { TileFailures } from './lib/tiles.ts';
 import { FPS, makeWarp, runTime, totalFrames, type WarpParams } from './lib/timewarp.ts';
 import { cameraAt, computeCameraTrack, type CameraTrack, type ViewBox } from './lib/camera.ts';
 import { BAND, buildHud, defaultTitles, drawHud, formatClock, type HudFrame, type HudModel } from './lib/hud.ts';
@@ -59,6 +61,9 @@ const el = {
   forget: $<HTMLButtonElement>('forget'),
   pickStatus: $<HTMLParagraphElement>('pick-status'),
   homeNote: $<HTMLParagraphElement>('home-note'),
+  storageNote: $<HTMLParagraphElement>('storage-note'),
+  showSpots: $<HTMLInputElement>('show-spots'),
+  spotsRow: $<HTMLElement>('spots-row'),
   privacyRadius: $<HTMLInputElement>('privacy-radius'),
   privacyVal: $<HTMLSpanElement>('privacy-val'),
   mapStatus: $<HTMLParagraphElement>('map-status'),
@@ -98,27 +103,41 @@ const state = {
   approxHomes: false,   // privacy-trimmed file: starts and homes are approximate
   defaultRadius: 200,
   prefs: loadPrefs() as Prefs,
+  fingerprint: '',      // identifies the loaded data file, to scope selection and picked homes
+  homeSpacing: 1000,
   homeId: '',
   picking: false,
+  wasPlaying: false,
   cursor: null as Home | null,
 };
 
-interface HomeEntry { id: string; lat: number; lon: number; label: string; custom: boolean }
+interface HomeEntry {
+  id: string; lat: number; lon: number; label: string; custom: boolean;
+  spotOf: string | null; // a nearby start spot of this home id
+}
 
-/** Candidate homes from the file, then homes picked on the map. */
+const yearsOf = (first: number | string, last: number | string) => (String(first) === String(last) ? `${first}` : `${first}–${last}`);
+const prefsForData = () => dataPrefs(state.prefs, state.fingerprint);
+
+/** Candidate homes from the file (homes and nearby start spots), then homes picked on the map. */
 function homeEntries(): HomeEntry[] {
-  const r = state.defaultRadius;
-  const cands = state.candidates.map((h, i) => {
-    const id = candidateId(h.lat, h.lon);
-    const name = state.prefs.names[id] || `Home ${i + 1}`;
-    const years = h.first === h.last ? `${h.first}` : `${h.first}–${h.last}`;
-    return { id, lat: h.lat, lon: h.lon, custom: false, label: `${name} · ${h.runs} runs · ${years}${h.fromOption ? ' · --home' : ''}` };
+  const groups = groupHomes(state.candidates, state.homeSpacing);
+  const names: string[] = [];
+  let k = 0;
+  for (let i = 0; i < state.candidates.length; i++) if (groups[i] === null) names[i] = `Home ${++k}`;
+  const cands = state.candidates.map((h, i): HomeEntry => {
+    const g = groups[i];
+    const name = state.prefs.names[h.id] || (g === null ? names[i] : `Start spot near ${state.prefs.names[state.candidates[g].id] || names[g]}`);
+    return {
+      id: h.id, lat: h.lat, lon: h.lon, custom: false, spotOf: g === null ? null : state.candidates[g].id,
+      label: `${name} · ${h.runs} runs · ${yearsOf(h.first, h.last)}${h.fromOption ? ' · --home' : ''}`,
+    };
   });
-  const custom = state.prefs.custom.map((c, i) => {
+  const custom = prefsForData().custom.map((c, i): HomeEntry => {
     const name = state.prefs.names[c.id] || `Picked home ${i + 1}`;
-    const rg = homeRange(state.all, c, r);
-    const years = rg.count ? (rg.first.slice(0, 4) === rg.last.slice(0, 4) ? rg.first.slice(0, 4) : `${rg.first.slice(0, 4)}–${rg.last.slice(0, 4)}`) : 'no runs';
-    return { id: c.id, lat: c.lat, lon: c.lon, custom: true, label: `${name} · ${rg.count} runs · ${years}` };
+    const rg = homeRange(state.all, c, state.prefs.radii[c.id] ?? state.defaultRadius);
+    const years = rg.count ? yearsOf(rg.first.slice(0, 4), rg.last.slice(0, 4)) : 'no runs';
+    return { id: c.id, lat: c.lat, lon: c.lon, custom: true, spotOf: null, label: `${name} · ${rg.count} runs · ${years}` };
   });
   return [...cands, ...custom];
 }
@@ -126,7 +145,10 @@ function homeEntries(): HomeEntry[] {
 const currentHome = (): HomeEntry | undefined => homeEntries().find((h) => h.id === state.homeId);
 
 function persist() {
-  if (!savePrefs(state.prefs)) el.homeNote.textContent = 'Home names and picks cannot be saved in this browser (storage is blocked); they last until you reload.';
+  if (!savePrefs(state.prefs)) {
+    // its own line, so switching homes doesn't clear it
+    el.storageNote.textContent = 'This browser blocks storage, so home names, radii and picked homes are not saved; they last until you reload.';
+  }
 }
 
 // ---------------------------------------------------------------- map
@@ -187,10 +209,9 @@ map.on('error', (e) => {
   if (ev.tile || ev.sourceId) {
     mapHealth.tileErrors++;
     const c = (ev.tile as TileLike | undefined)?.tileID?.canonical;
-    if (c && ev.sourceId) failedTiles.set(`${ev.sourceId}/${c.z}/${c.x}/${c.y}`, { source: ev.sourceId, z: c.z, x: c.x, y: c.y });
+    if (c && ev.sourceId) failedTiles.fail(ev.sourceId, c);
     mapHealth.lastError = msg;
-    setMapStatus(`${mapHealth.tileErrors} map tile request${mapHealth.tileErrors === 1 ? '' : 's'} failed (${msg}). `
-      + 'The basemap has gaps; check the network connection. Exports list the affected frames.');
+    updateTileStatus();
     return;
   }
   console.warn('map:', msg);
@@ -207,42 +228,43 @@ map.on('style.load', () => {
   hideMessage('style');
   // tiles that take long to arrive: say so (without blocking the page) until the map has settled once
   const slow = setTimeout(() => {
-    if (!mapHealth.tileErrors && !mapHealth.fontFallback) setMapStatus('Map tiles are loading slowly from CARTO…');
+    if (!failedTilesInView().size && !mapHealth.fontFallback) setMapStatus('Map tiles are loading slowly from CARTO…');
   }, 20000);
   map.once('idle', () => {
     clearTimeout(slow);
-    if (!mapHealth.tileErrors && !mapHealth.fontFallback) setMapStatus('');
+    updateTileStatus();
   });
 });
 
 type TileLike = { state: string; tileID: { canonical: { x: number; y: number; z: number } } };
 
 /** Tiles whose request failed and that have not loaded since. */
-const failedTiles = new Map<string, { source: string; z: number; x: number; y: number }>();
+const failedTiles = new TileFailures();
 map.on('sourcedata', (e) => {
   const ev = e as unknown as { sourceId?: string; tile?: TileLike };
   const c = ev.tile?.tileID?.canonical;
-  if (c && ev.sourceId && ev.tile?.state === 'loaded') failedTiles.delete(`${ev.sourceId}/${c.z}/${c.x}/${c.y}`);
+  if (c && ev.sourceId && ev.tile?.state === 'loaded' && failedTiles.loaded(ev.sourceId, c)) updateTileStatus();
 });
 
-/** Failed tiles at the zoom the map currently draws that overlap the current view, per source. */
-function failedTilesInView(): Map<string, { x: number; y: number; z: number }[]> {
-  const out = new Map<string, { x: number; y: number; z: number }[]>();
-  if (!failedTiles.size) return out;
-  const b = map.getBounds();
-  const zIdeal = Math.floor(map.getZoom());
-  const lonOfX = (x: number, z: number) => (x / 2 ** z) * 360 - 180;
-  const latOfY = (y: number, z: number) => (Math.atan(Math.sinh(Math.PI * (1 - (2 * y) / 2 ** z))) * 180) / Math.PI;
-  for (const t of failedTiles.values()) {
-    // the source's max zoom caps the ideal zoom, so also accept the deepest tiles below it
-    if (t.z > zIdeal || t.z < Math.min(zIdeal, 15) - 1) continue;
-    const w = lonOfX(t.x, t.z), e = lonOfX(t.x + 1, t.z), n = latOfY(t.y, t.z), s = latOfY(t.y + 1, t.z);
-    if (e < b.getWest() || w > b.getEast() || n < b.getSouth() || s > b.getNorth()) continue;
-    const list = out.get(t.source) ?? [];
-    list.push({ x: t.x, y: t.y, z: t.z });
-    out.set(t.source, list);
+map.on('idle', () => updateTileStatus());
+/** The map status line follows the tiles that are failing right now and clears once they load. */
+function updateTileStatus() {
+  let n = 0;
+  for (const list of failedTilesInView().values()) n += list.length;
+  if (n) {
+    setMapStatus(`${n} map tile${n === 1 ? '' : 's'} in view failed to load (${mapHealth.lastError}). `
+      + 'The basemap has gaps; check the network connection. Exports list the affected frames.');
+  } else {
+    setMapStatus(mapHealth.fontFallback ? 'The map label fonts failed to load, so labels use a fallback font. Check the network connection.' : '');
   }
-  return out;
+}
+
+/** Failed tiles at the zoom the map currently draws that overlap the current view, per source. */
+function failedTilesInView() {
+  if (!failedTiles.size) return new Map<string, { x: number; y: number; z: number }[]>();
+  const b = map.getBounds();
+  return failedTiles.inView({ west: b.getWest(), south: b.getSouth(), east: b.getEast(), north: b.getNorth() }, map.getZoom(),
+    (source) => (map.getSource(source) as { maxzoom?: number } | undefined)?.maxzoom ?? 22);
 }
 /** Tiles in view whose request failed, per source (reads MapLibre's tile managers; empty if that changes). */
 function erroredTiles(): Map<string, { x: number; y: number; z: number }[]> {
@@ -358,6 +380,8 @@ function rebuild() {
     overlay.setProps({ layers: [] });
     clearHud();
     showText('No runs match the filter.');
+    el.title.placeholder = 'HOME RUNS';
+    el.subtitle.placeholder = 'no runs start near this home';
     setControlsEnabled(false);
     return;
   }
@@ -554,9 +578,16 @@ function stallGuard() {
 
 async function runExport(req: ExportRequest = {}): Promise<ExportOutcome> {
   const m = state.model; // frozen for the whole export: trails, camera and HUD all come from it
-  if (!m) throw new Error('no runs loaded');
-  if (document.hidden) throw new Error('the tab is hidden; keep it visible to export');
-  if (!styleLoaded) throw new Error('the basemap has not loaded yet');
+  if (!m) {
+    el.exportStatus.textContent = "Can't export: no runs match the current home and filters.";
+    throw new Error('no runs');
+  }
+  const refuse = (msg: string): never => {
+    el.exportStatus.textContent = `Can't export yet: ${msg}.`;
+    throw new Error(msg);
+  };
+  if (document.hidden) refuse('the tab is hidden; keep it visible while exporting');
+  if (!styleLoaded) refuse('the basemap has not loaded (check the network connection and reload)');
   if (state.picking) stopPicking();
   const trailColor = state.trailColor;
   const [selW, selH] = el.size.value.split('x').map(Number);
@@ -701,7 +732,10 @@ function useData(file: RunsFile) {
   if (!all.length) throw new Error('the runs file has no runs');
   if (!Array.isArray(file.meta?.homes) || !file.meta.homes.length) throw new Error('the runs file lists no homes');
   state.all = all;
-  state.candidates = file.meta.homes;
+  state.candidates = file.meta.homes.map((h, i) => ({ ...h, id: typeof h.id === 'string' ? h.id : `h:index:${i}` }));
+  state.homeSpacing = Number.isFinite(file.meta.homeSpacing) ? file.meta.homeSpacing : 1000;
+  // runs are sorted by date: the earliest run's id tells exports apart without saying where anyone lives
+  state.fingerprint = `runs:${all[0].id}`;
   state.approxHomes = !!file.meta.privacyTrimmed;
   state.defaultRadius = Math.max(5, Math.ceil(file.meta.radius / 5) * 5);
   const days = state.all.map((r) => r.day).sort();
@@ -720,28 +754,50 @@ function useData(file: RunsFile) {
   el.load.hidden = true;
   fillHomes();
   const ids = homeEntries().map((h) => h.id);
-  selectHome(state.prefs.selected && ids.includes(state.prefs.selected) ? state.prefs.selected : ids[0]);
+  const sel = prefsForData().selected;
+  selectHome(sel && ids.includes(sel) ? sel : ids[0]);
 }
 
 function fillHomes() {
-  el.home.replaceChildren(...homeEntries().map((h) => new Option(h.label, h.id)), new Option('Pick on map…', 'pick'));
+  const entries = homeEntries();
+  const current = entries.find((h) => h.id === state.homeId);
+  if (current?.spotOf) el.showSpots.checked = true; // never hide the selected home
+  const spots = entries.filter((h) => h.spotOf);
+  el.spotsRow.hidden = !spots.length;
+  const opts: (HTMLOptionElement | HTMLOptGroupElement)[] = entries.filter((h) => !h.spotOf).map((h) => new Option(h.label, h.id));
+  if (spots.length && el.showSpots.checked) {
+    const g = document.createElement('optgroup');
+    g.label = 'Nearby start spots';
+    g.append(...spots.map((h) => new Option(h.label, h.id)));
+    opts.push(g);
+  }
+  el.home.replaceChildren(...opts, new Option('Pick on map…', 'pick'));
   el.home.value = state.homeId;
 }
 
-/** Switch home: date range, name field and the model follow it. */
+/** Runs and dates for the chosen home with the current radius: keep the date range in step. */
+function syncDatesToHome() {
+  const h = currentHome();
+  if (!h) return;
+  const rg = homeRange(state.all, h, Number(el.radius.value));
+  el.from.value = rg.first || el.from.min;
+  el.to.value = rg.last || el.to.max;
+  el.homeNote.textContent = rg.count ? '' : 'No runs start near this home; try a larger radius.';
+}
+
+/** Switch home: its radius, date range, name field and the model follow it. */
 function selectHome(id: string) {
   const h = homeEntries().find((e) => e.id === id);
   if (!h) return;
   state.homeId = id;
-  state.prefs.selected = id;
+  prefsForData().selected = id;
   persist();
-  el.home.value = id;
+  fillHomes();
   el.homeName.value = state.prefs.names[id] ?? '';
   el.forget.hidden = !h.custom;
-  const rg = homeRange(state.all, h, Number(el.radius.value));
-  el.from.value = rg.first || el.from.min;
-  el.to.value = rg.last || el.to.max;
-  el.homeNote.textContent = rg.count ? '' : 'No runs start near this home yet; try a larger radius.';
+  el.radius.value = String(state.prefs.radii[id] ?? state.defaultRadius);
+  el.radiusVal.textContent = `${el.radius.value} m`;
+  syncDatesToHome();
   state.frame = 0;
   setPlaying(false);
   rebuild();
@@ -752,6 +808,7 @@ function selectHome(id: string) {
 function startPicking() {
   if (!state.all.length || state.exporting) return;
   state.picking = true;
+  state.wasPlaying = state.playing;
   setPlaying(false);
   setMapInteractive(true);
   el.pick.hidden = true;
@@ -762,7 +819,8 @@ function startPicking() {
   state.dirty = true;
 }
 
-function stopPicking() {
+/** Leave pick mode; `restore` resumes playback if it was running (Cancel / Escape). */
+function stopPicking(restore = false) {
   state.picking = false;
   state.cursor = null;
   setMapInteractive(false);
@@ -772,6 +830,7 @@ function stopPicking() {
   el.stage.classList.remove('picking');
   el.home.value = state.homeId;
   state.dirty = true;
+  if (restore && state.wasPlaying && state.model) setPlaying(true);
 }
 
 /** All runs, fully drawn, plus a circle of the start radius at the cursor and the known homes. */
@@ -815,13 +874,22 @@ map.on('mousemove', (e) => {
 
 map.on('click', (e) => {
   if (!state.picking) return;
+  // a click on (or right next to) a known home selects it instead of adding a duplicate
+  const hit = homeEntries()
+    .map((h) => ({ h, d: map.project([h.lon, h.lat]).dist(e.point) }))
+    .filter((x) => x.d <= 12)
+    .sort((a, b) => a.d - b.d)[0];
+  stopPicking();
+  if (hit) {
+    selectHome(hit.h.id);
+    return;
+  }
   const lat = Math.round(e.lngLat.lat * 1e5) / 1e5;
   const lon = Math.round(e.lngLat.lng * 1e5) / 1e5;
   const id = customId(lat, lon);
-  if (!state.prefs.custom.some((c) => c.id === id)) state.prefs.custom.push({ id, lat, lon });
+  const dp = prefsForData();
+  if (!dp.custom.some((c) => c.id === id)) dp.custom.push({ id, lat, lon });
   persist();
-  stopPicking();
-  fillHomes();
   selectHome(id);
 });
 
@@ -874,6 +942,10 @@ for (const i of [el.from, el.to, el.seconds]) i.onchange = rebuild;
 el.radius.oninput = () => {
   el.radiusVal.textContent = `${el.radius.value} m`;
   if (state.picking) { if (state.cursor) el.pickStatus.textContent = previewCount(state.cursor); state.dirty = true; return; }
+  state.prefs.radii[state.homeId] = Number(el.radius.value);
+  persist();
+  syncDatesToHome(); // the home's runs, and so its years, depend on the radius
+  fillHomes();
   rebuildSoon();
 };
 el.privacyRadius.oninput = () => {
@@ -884,7 +956,8 @@ el.privacyRadius.oninput = () => {
 };
 el.home.onchange = () => { if (el.home.value === 'pick') startPicking(); else selectHome(el.home.value); };
 el.pick.onclick = startPicking;
-el.pickCancel.onclick = stopPicking;
+el.pickCancel.onclick = () => stopPicking(true);
+el.showSpots.onchange = fillHomes;
 el.homeName.oninput = () => {
   const name = el.homeName.value.trim();
   if (name) state.prefs.names[state.homeId] = name; else delete state.prefs.names[state.homeId];
@@ -893,8 +966,10 @@ el.homeName.oninput = () => {
   rebuildSoon();
 };
 el.forget.onclick = () => {
-  state.prefs.custom = state.prefs.custom.filter((c) => c.id !== state.homeId);
+  const dp = prefsForData();
+  dp.custom = dp.custom.filter((c) => c.id !== state.homeId);
   delete state.prefs.names[state.homeId];
+  delete state.prefs.radii[state.homeId];
   persist();
   fillHomes();
   selectHome(homeEntries()[0].id);
@@ -909,7 +984,8 @@ el.file.onchange = async () => {
   try { useData(JSON.parse(await f.text())); } catch (e) { showText(`Could not read ${f.name}: ${(e as Error).message}`); }
 };
 window.addEventListener('keydown', (e) => {
-  if (e.code === 'Escape' && state.picking) stopPicking();
+  if (e.code === 'Escape' && state.picking) stopPicking(true);
+  if (e.code === 'Space' && state.picking) { e.preventDefault(); return; } // no playback while picking
   if (e.code === 'Space' && !(e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement)) {
     e.preventDefault();
     el.play.click();

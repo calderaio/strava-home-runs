@@ -217,19 +217,32 @@ export interface HomeCluster {
 /**
  * Every place many runs start from: the densest start cluster (findHome), then the densest among the
  * remaining starts, and so on, while a cluster has at least `minRuns` starts within `radius`.
+ * The members of a home are its starts within `radius`; starts within `exclude` (2 x radius by
+ * default) are left out of the further search, so the next cluster can't form right next to it.
  */
-export function findHomes(starts: [number, number][], radius: number, minRuns: number): HomeCluster[] {
+export function findHomes(starts: [number, number][], radius: number, minRuns: number, exclude = 2 * radius): HomeCluster[] {
   let remaining = starts.map((_, i) => i);
   const out: HomeCluster[] = [];
-  while (remaining.length >= Math.max(1, minRuns)) {
+  const min = Math.max(1, minRuns);
+  while (remaining.length >= min) {
     const [lat, lon] = findHome(remaining.map((i) => starts[i]), radius);
     const members = remaining.filter((i) => distTo(starts[i][0], starts[i][1], [lat, lon]) <= radius);
-    if (members.length < Math.max(1, minRuns)) break;
+    if (members.length < min) break;
     out.push({ lat, lon, members });
-    const taken = new Set(members);
-    remaining = remaining.filter((i) => !taken.has(i));
+    remaining = remaining.filter((i) => distTo(starts[i][0], starts[i][1], [lat, lon]) > Math.max(exclude, radius));
   }
   return out;
+}
+
+/**
+ * Privacy trim for every run: drop its start while within `radius` of where it began, its end while
+ * within `radius` of where it ended (like Strava's hide start/end), and both while within `radius`
+ * of any of `homes`.
+ */
+export function hidePrivateEnds(tr: Track, homes: [number, number][], radius: number): Track | null {
+  const n = tr.t.length;
+  const own: [number, number][] = [[tr.lat[0], tr.lon[0]], [tr.lat[n - 1], tr.lon[n - 1]]];
+  return hideEnds(tr, [...homes, ...own], radius);
 }
 
 export function distTo(lat: number, lon: number, home: [number, number]): number {

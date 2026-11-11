@@ -11,13 +11,15 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, s
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { encodePath, type HomeCandidate, type RunRecord, type RunsFile } from '../src/lib/format.ts';
+import { groupHomes } from '../src/lib/homes.ts';
 import { parseCsv } from './csv.ts';
 import {
-  clean, distTo, downsample, findHomes, formatOf, hideEnds, parseTrackBytes, pathLength, toTrack, type Track,
+  clean, distTo, downsample, findHomes, formatOf, hidePrivateEnds, parseTrackBytes, pathLength, toTrack, type Track,
 } from './track.ts';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SCALE = 1e5; // ~1 m
+const PRIVATE_DEFAULT_RADIUS = 2000;
 
 export interface Options {
   input: string;
@@ -31,6 +33,7 @@ export interface Options {
   minDt: number;
   minDist: number;
   minHomeRuns: number;
+  homeSpacing: number;
   out: string;
 }
 
@@ -43,11 +46,13 @@ const USAGE = `usage: bun ingest/ingest.ts [strava export folder | folder of .fi
   --radius <m>          a home's runs start within this many metres of it; the page's default (200)
   --home <lat,lon>      add this home first (or replace the detected home it is close to)
   --min-home-runs <n>   a place needs this many run starts to become a home candidate (10)
+  --home-spacing <m>    the page lists homes closer than this to a larger one as nearby start spots (1000)
   --since <YYYY-MM-DD>  first date to include (UTC)
   --until <YYYY-MM-DD>  last date to include (UTC)
   --sport <name>        keep activities whose type contains this; "any" keeps all (run)
   --max-speed <m/s>     faster GPS jumps are dropped as spikes (7)
-  --privacy-radius <m>  trim each track's start and end inside this radius of every home (0)
+  --privacy-radius <m>  trim each run's start and end within this radius of where it began and ended
+                        and of every home; homes are then rounded to ~1 km (0)
   --min-dt <s>          minimum time between kept points (5)
   --min-dist <m>        minimum distance between kept points (10)
   --out <file>          output JSON (web/data/runs.json)`;
@@ -61,7 +66,7 @@ const isDay = (v: string) => {
 export function parseArgs(argv: string[]): Options {
   const o: Options = {
     input: '', radius: 200, home: null, since: null, until: null, sport: 'run', maxSpeed: 7,
-    privacyRadius: 0, minDt: 5, minDist: 10, minHomeRuns: 10, out: join(HERE, '..', 'data', 'runs.json'),
+    privacyRadius: 0, minDt: 5, minDist: 10, minHomeRuns: 10, homeSpacing: 1000, out: join(HERE, '..', 'data', 'runs.json'),
   };
   const num = (k: string, v: string | undefined, min: number, strict = false) => {
     const n = Number(v);
@@ -97,6 +102,7 @@ export function parseArgs(argv: string[]): Options {
       case '--min-dt': o.minDt = num(a, v, 0); i++; break;
       case '--min-dist': o.minDist = num(a, v, 0); i++; break;
       case '--min-home-runs': o.minHomeRuns = Math.round(num(a, v, 1)); i++; break;
+      case '--home-spacing': o.homeSpacing = num(a, v, 0); i++; break;
       case '--out':
         if (!v || v.startsWith('--')) throw new UsageError('--out needs a path');
         o.out = resolve(v); i++; break;
@@ -242,7 +248,10 @@ export function runIngest(o: Options): { file: RunsFile; summary: Summary } {
   const candidate = (lat: number, lon: number, fromOption = false): HomeCandidate => {
     const near = starts.flatMap((s, i) => (distTo(s[0], s[1], [lat, lon]) <= o.radius ? [i] : []));
     const years = near.map(year);
+    // id from the earliest run starting there: stable across re-ingests and says nothing about location
+    const earliest = near.reduce((a, i) => (a < 0 || cands[i].track.start < cands[a].track.start ? i : a), -1);
     return {
+      id: earliest >= 0 ? `h:${cands[earliest].act.id}` : `h:option:${lat},${lon}`,
       lat, lon, runs: near.length, first: years.length ? Math.min(...years) : 0, last: years.length ? Math.max(...years) : 0,
       ...(fromOption ? { fromOption } : {}),
     };
@@ -260,8 +269,9 @@ export function runIngest(o: Options): { file: RunsFile; summary: Summary } {
     throw new UsageError(`no runs start within ${o.radius} m of --home ${o.home![0]},${o.home![1]}; try a larger --radius`);
   }
 
-  // Every run with GPS is kept, so the page can show the runs of any home. With --privacy-radius the
-  // ends near every home are trimmed and the homes are stored rounded to ~1 km.
+  // Every run with GPS is kept, so the page can show the runs of any home. With --privacy-radius every
+  // run loses its start and end within that radius of where it began and ended and of every home, and
+  // the homes are stored rounded to ~1 km.
   const homePoints = homes.map((h): [number, number] => [h.lat, h.lon]);
   const ref: [number, number] = [Math.round(homes[0].lon * 100) / 100, Math.round(homes[0].lat * 100) / 100];
   const runs: RunRecord[] = [];
@@ -270,7 +280,7 @@ export function runIngest(o: Options): { file: RunsFile; summary: Summary } {
   for (const c of cands) {
     let tr: Track | null = c.track;
     if (o.privacyRadius > 0) {
-      tr = hideEnds(tr, homePoints, o.privacyRadius);
+      tr = hidePrivateEnds(tr, homePoints, o.privacyRadius);
       if (!tr) { skip('nothing left outside --privacy-radius'); continue; }
     }
     const animatedDist = pathLength(tr);
@@ -289,6 +299,8 @@ export function runIngest(o: Options): { file: RunsFile; summary: Summary } {
   }
   if (o.privacyRadius > 0) {
     homes = homes.map((h) => ({ ...h, lat: Math.round(h.lat * 100) / 100, lon: Math.round(h.lon * 100) / 100 }));
+    // the --home id would otherwise carry its exact coordinates
+    homes = homes.map((h) => (h.id.startsWith('h:option:') ? { ...h, id: 'h:option' } : h));
   }
   if (!runs.length) throw new UsageError('no runs left after --privacy-radius trimming');
   runs.sort((a, b) => a.date.localeCompare(b.date));
@@ -299,9 +311,10 @@ export function runIngest(o: Options): { file: RunsFile; summary: Summary } {
     scale: SCALE,
     ref,
     meta: {
-      // trimmed starts lie around the privacy circle and homes are rounded, so filter more loosely
-      radius: o.privacyRadius > 0 ? Math.ceil((o.radius + o.privacyRadius + 1000) / 100) * 100 : o.radius,
-      privacyTrimmed: o.privacyRadius > 0, homes, maxSpeed: o.maxSpeed, sport: o.sport,
+      // trimmed starts and rounded homes are only approximate, so the page filters more loosely; the
+      // default is fixed so it says nothing about the privacy radius
+      radius: o.privacyRadius > 0 ? Math.max(PRIVATE_DEFAULT_RADIUS, o.radius) : o.radius,
+      privacyTrimmed: o.privacyRadius > 0, homes, homeSpacing: o.homeSpacing, maxSpeed: o.maxSpeed, sport: o.sport,
       since: o.since, until: o.until,
     },
     runs,
@@ -335,7 +348,8 @@ export function writeRuns(out: string, file: RunsFile): number {
   return json.length;
 }
 
-export function formatSummary(s: Summary, radius: number, out: string, bytes: number): string {
+export function formatSummary(s: Summary, radius: number, out: string, bytes: number, spacing = 1000): string {
+  const groups = groupHomes(s.homes, spacing);
   const lines = [
     `input:         ${s.input}${s.fromCsv ? ' (activities.csv)' : ' (file scan)'}`,
     `activities:    ${s.activities}`,
@@ -344,7 +358,8 @@ export function formatSummary(s: Summary, radius: number, out: string, bytes: nu
     `runs kept:     ${s.kept} with GPS${s.years ? ` (${s.years[0]}-${s.years[1]})` : ''}`,
     `homes:         ${s.homes.length} (places with runs starting within ${radius} m)`,
     ...s.homes.map((h, i) => `  ${String(i + 1).padStart(3)}. ${h.lat.toFixed(4)}, ${h.lon.toFixed(4)} · ${h.runs} runs · `
-      + `${h.first === h.last ? h.first : `${h.first}-${h.last}`}${h.fromOption ? ' (--home)' : ''}`),
+      + `${h.first === h.last ? h.first : `${h.first}-${h.last}`}${h.fromOption ? ' (--home)' : ''}`
+      + (groups[i] === null ? '' : ` (start spot near ${groups[i]! + 1})`)),
     `cut at signal loss: ${s.cutAtSignalLoss} of the kept runs`,
     ...(s.truncated ? [`truncated:     ${s.truncated} files (partial data kept)`] : []),
     `points:        ${s.points}`,
@@ -360,7 +375,7 @@ export function main(argv = process.argv.slice(2)): number {
     const o = parseArgs(argv);
     const { file, summary } = runIngest(o);
     const bytes = writeRuns(o.out, file);
-    console.log(formatSummary(summary, o.radius, o.out, bytes));
+    console.log(formatSummary(summary, o.radius, o.out, bytes, o.homeSpacing));
     return 0;
   } catch (e) {
     if (e instanceof IoError) {

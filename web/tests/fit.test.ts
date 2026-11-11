@@ -104,6 +104,29 @@ describe('FIT', () => {
     expect(r.time[0]).toBe(T0);
   });
 
+  test('each truncation is flagged on its own: header promises more data, or a corrupt message', () => {
+    // 1) cut exactly after a whole record: decoding ends cleanly, but the header says there is more
+    const w = new Fit();
+    w.def(0, 20, REC);
+    PTS.forEach(([la, lo, ts]) => w.data(0, rec(la, lo, ts)));
+    const full = w.bytes();
+    const recordSize = 1 + 4 + 4 + 4 + 1;
+    const cut = parseFit(full.subarray(0, full.length - 2 - 3 * recordSize));
+    expect(cut.lat.length).toBe(9);
+    expect(cut.truncated).toBe(true);
+    // 2) complete length, but a message for an undefined local type halfway
+    const c = new Fit();
+    c.def(0, 20, REC);
+    PTS.slice(0, 5).forEach(([la, lo, ts]) => c.data(0, rec(la, lo, ts)));
+    c.data(7, [[1, 1]]);
+    PTS.slice(5).forEach(([la, lo, ts]) => c.data(0, rec(la, lo, ts)));
+    const corrupt = parseFit(c.bytes());
+    expect(corrupt.lat.length).toBe(5);
+    expect(corrupt.truncated).toBe(true);
+    // 3) an intact file is not flagged
+    expect(parseFit(full).truncated).toBeUndefined();
+  });
+
   test('rejects non-FIT data and files that fail before any record', () => {
     expect(() => parseFit(new Uint8Array(20))).toThrow();
     const w = new Fit();

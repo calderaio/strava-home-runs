@@ -33,6 +33,17 @@ describe('filterRuns by an arbitrary home', () => {
     expect(ids('0000', '9999', 50, elsewhere)).toEqual([]);
   });
 
+  test('the radius bound is inclusive to the metre', () => {
+    const exact = distToHome(runs[1].start[0], runs[1].start[1], home);
+    expect(ids('0000', '9999', exact)).toEqual(['a', 'b']);
+    expect(ids('0000', '9999', exact - 1e-9)).toEqual(['a']);
+  });
+
+  test('homeRange takes the earliest and latest day whatever the order', () => {
+    const shuffled = [runs[2], runs[0], runs[3], runs[1]];
+    expect(homeRange(shuffled, home, 200)).toEqual({ count: 3, first: '2024-01-01', last: '2024-12-31' });
+  });
+
   test('homeRange counts the runs and their dates for any home', () => {
     expect(homeRange(runs, home, 200)).toEqual({ count: 4, first: '2024-01-01', last: '2024-12-31' });
     expect(homeRange(runs, elsewhere, 200)).toEqual({ count: 1, first: '2025-01-01', last: '2025-01-01' });
@@ -55,6 +66,12 @@ describe('page-side privacy trimming', () => {
     expect(t.start).toEqual([t.lonlat[0], t.lonlat[1]]);
     expect(distToHome(t.start[0], t.start[1], home)).toBeLessThan(231);
     expect(t.t.length).toBe(41 - 7 - 7); // 0..180 m out and 180..0 m back are inside
+  });
+
+  test('two points left outside the radius are enough; one is not', () => {
+    const mk = (east: number[]) => run(east.flatMap((x) => { const [lat, lon] = offset(x); return [lon, lat]; }), east.map((_, i) => i));
+    expect(trimAround(mk([0, 100, 300, 320, 100, 0]), home, 200)?.t.length).toBe(2);
+    expect(trimAround(mk([0, 100, 300, 100, 0]), home, 200)).toBeNull();
   });
 
   test('radius 0 keeps the run; a run that never leaves the radius disappears', () => {
@@ -82,7 +99,7 @@ describe('decodeRuns', () => {
   test('decodes paths, dates and start points; rejects other versions', () => {
     const file: RunsFile = {
       version: 2, generatedAt: '', scale: 1e5, ref: REF,
-      meta: { radius: 200, privacyTrimmed: false, homes: [{ lat: HOME[0], lon: HOME[1], runs: 2, first: 2023, last: 2024 }], maxSpeed: 7, sport: 'run', since: null, until: null },
+      meta: { radius: 200, privacyTrimmed: false, homes: [{ id: 'h:1', lat: HOME[0], lon: HOME[1], runs: 2, first: 2023, last: 2024 }], homeSpacing: 1000, maxSpeed: 7, sport: 'run', since: null, until: null },
       runs: [
         { id: '1', name: 'a', date: '2024-05-01T07:00:00Z', dist: 100, dur: 60, p: encodePath([HOME[1], HOME[1] + 1e-3], [HOME[0], HOME[0]], [0, 60], REF, 1e5) },
         { id: '2', name: 'b', date: '2023-12-31T23:30:00Z', dist: 100, dur: 60, p: encodePath([HOME[1], HOME[1]], [HOME[0], HOME[0] + 1e-3], [0, 60], REF, 1e5) },

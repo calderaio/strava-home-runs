@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { clean, distTo, downsample, findHome, findHomes, hideEnds, metresPerDegree, type Track } from '../ingest/track.ts';
+import { clean, distTo, downsample, findHome, findHomes, hideEnds, hidePrivateEnds, metresPerDegree, type Track } from '../ingest/track.ts';
 import { HOME, offset } from './fixtures.ts';
 
 const [, KX] = metresPerDegree(HOME[0]);
@@ -64,6 +64,36 @@ describe('home candidates', () => {
     expect(findHomes(starts, 200, 9).map((h) => h.members.length)).toEqual([10, 9]);
     expect(findHomes(starts, 200, 11)).toEqual([]);
     expect(findHomes([], 200, 1)).toEqual([]);
+  });
+
+  test('no new home forms right outside a found one (starts within 2x radius are left out)', () => {
+    const starts = [...cluster(0, 0, 30), ...cluster(0, 300, 12), ...cluster(0, 450, 12)];
+    // the cluster 300 m away lies within 400 m and is not searched again; the one at 450 m is
+    expect(findHomes(starts, 200, 10).map((h) => h.members.length)).toEqual([30, 12]);
+    expect(distTo(findHomes(starts, 200, 10)[1].lat, findHomes(starts, 200, 10)[1].lon, offset(15, 460))).toBeLessThan(10);
+    // excluding only the radius lets a home form right next door, from both nearby groups
+    expect(findHomes(starts, 200, 10, 200).map((h) => h.members.length)).toEqual([30, 24]);
+  });
+
+  test('a run starting at the second of several homes is trimmed there too', () => {
+    const other = offset(3000);
+    const e = [...line(201), ...line(200).reverse()].map((x) => 3000 + x); // out and back from the second home
+    const h = hideEnds(track(e), [HOME, other], 150)!;
+    expect(distTo(h.lat[0], h.lon[0], other)).toBeGreaterThan(150);
+    expect(distTo(h.lat[h.lat.length - 1], h.lon[h.lon.length - 1], other)).toBeGreaterThan(150);
+  });
+
+  test('hidePrivateEnds trims every run around its own start and end, and around every home', () => {
+    // a run from far away (no home nearby): 0 -> 900 m east of a point 20 km out
+    const e = line(301).map((x) => 20000 + x);
+    const h = hidePrivateEnds(track(e), [HOME, offset(3000)], 200)!;
+    const first = 20000, last = 20000 + 900;
+    expect((h.lon[0] - HOME[1]) * KX - first).toBeGreaterThan(200);
+    expect(last - (h.lon[h.lon.length - 1] - HOME[1]) * KX).toBeGreaterThan(200);
+    // a run from the second home is trimmed around it as well
+    const r2 = [...line(201), ...line(200).reverse()].map((x) => 3000 + x);
+    const h2 = hidePrivateEnds(track(r2), [HOME, offset(3000)], 150)!;
+    expect(distTo(h2.lat[0], h2.lon[0], offset(3000))).toBeGreaterThan(150);
   });
 
   test('privacy trimming around several homes', () => {

@@ -18,6 +18,8 @@ export interface RunRecord {
 
 /** A place many runs start from. */
 export interface HomeCandidate {
+  /** stable id (from the earliest run starting there), independent of the stored coordinates */
+  id: string;
   lat: number;
   lon: number;
   runs: number;     // runs that start within meta.radius
@@ -38,6 +40,8 @@ export interface RunsFile {
     privacyTrimmed: boolean;
     /** home candidates, densest first (or the --home one first) */
     homes: HomeCandidate[];
+    /** the page lists candidates closer than this (m) to a larger one as nearby start spots */
+    homeSpacing: number;
     maxSpeed: number;
     sport: string;
     since: string | null;
