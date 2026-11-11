@@ -126,6 +126,20 @@ The page loads map tiles from CARTO; everything else stays on your machine. `bun
 
 Other commands, all run in `web/`: `bun test`, `bun run typecheck` and `bun run build` (static files go to `web/dist/`, without your data).
 
+On a phone the page keeps the 9:16 map on screen. In portrait, the controls are a bottom sheet: closed, it shows play, replay and the scrubber; **Settings** opens the rest. In landscape, they are a column beside the map. All controls are at least 44 px tall. **Pick on map** works by touch: drag to pan and pinch to zoom. The first tap shows how many runs start there; tap the spot again or press **Use this spot** to use it.
+
+### Hosting it
+
+`bun run build:site` builds a self-contained static folder, `web/site/` (gitignored):
+
+- `index.html`: a landing page with a pre-rendered video and an **Open the live map** button.
+- `video.mp4` and `poster.jpg`: an H.264 export of the first home at 1080×1920 and 2.5 Mbit/s, with `moov` before `mdat` so phones start playing at once. It is rendered by headless Chrome (set `CHROME=` if it isn't found).
+- `map/`: the interactive page.
+- `map/data/runs.json` plus `.gz` and `.br` copies: **your full data file**.
+- `robots.txt`: disallows everything.
+
+The options are `--reuse-video` (keep the existing video and poster), `--size`, `--bitrate` and `--seconds`. Every page has `noindex`. The folder contains every track and every home, so only serve it behind a password, never in public, and never commit it.
+
 ## Privacy
 
 The video opens on your location of choice and every run leaves from it, which might show where you live.

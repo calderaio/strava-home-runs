@@ -13,8 +13,11 @@ import { FPS, makeWarp, runTime, totalFrames, type WarpParams } from './lib/time
 import { cameraAt, computeCameraTrack, type CameraTrack, type ViewBox } from './lib/camera.ts';
 import { BAND, buildHud, defaultTitles, drawHud, formatClock, type HudFrame, type HudModel } from './lib/hud.ts';
 import { exportVideo, type ExportResult } from './lib/video.ts';
+import { pickAction, pointerKind, type PointerKind } from './lib/pick.ts';
 
 const STYLE = 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json';
+/** Built with `bun run build:site`: the page is online (behind a password) instead of on localhost. */
+const HOSTED = import.meta.env.MODE === 'site';
 const STAGE_W = 540;
 const STAGE_H = 960;
 /** The map band from the HUD layout, in stage CSS px (the stage is half the 1080 x 1920 layout). */
@@ -58,6 +61,7 @@ const el = {
   homeName: $<HTMLInputElement>('home-name'),
   pick: $<HTMLButtonElement>('pick'),
   pickCancel: $<HTMLButtonElement>('pick-cancel'),
+  pickUse: $<HTMLButtonElement>('pick-use'),
   forget: $<HTMLButtonElement>('forget'),
   pickStatus: $<HTMLParagraphElement>('pick-status'),
   homeNote: $<HTMLParagraphElement>('home-note'),
@@ -80,6 +84,9 @@ const el = {
   exportStatus: $<HTMLParagraphElement>('export-status'),
   load: $<HTMLElement>('load'),
   file: $<HTMLInputElement>('file'),
+  panel: $<HTMLElement>('panel'),
+  sheetToggle: $<HTMLButtonElement>('sheet-toggle'),
+  back: $<HTMLAnchorElement>('back'),
 };
 
 interface Model {
@@ -108,7 +115,8 @@ const state = {
   homeId: '',
   picking: false,
   wasPlaying: false,
-  cursor: null as Home | null,
+  cursor: null as Home | null,   // under the mouse while picking
+  preview: null as Home | null,  // tapped once while picking (touch): shown, picked on the second tap
 };
 
 interface HomeEntry {
@@ -173,6 +181,7 @@ const map = new MlMap({
   canvasContextAttributes: { antialias: true, preserveDrawingBuffer: true },
 });
 const handlers = [map.dragPan, map.scrollZoom, map.doubleClickZoom, map.touchZoomRotate];
+map.touchZoomRotate.disableRotation(); // pinch zooms, but the map stays north-up
 const setMapInteractive = (on: boolean) => { for (const h of handlers) (on ? h.enable() : h.disable()); };
 setMapInteractive(false);
 const overlay = new MapboxOverlay({ interleaved: true, layers: [] });
@@ -551,6 +560,7 @@ let abort: AbortController | null = null;
 
 export interface ExportRequest {
   width?: number; height?: number; seconds?: number | null; download?: boolean;
+  bitrate?: number;     // bits per second (default scales with the frame size)
   hashes?: boolean;     // debug: SHA-256 of every composited frame
   capture?: number[];   // debug: return PNGs of these frames
 }
@@ -659,6 +669,7 @@ async function runExport(req: ExportRequest = {}): Promise<ExportOutcome> {
       height: H,
       fps: FPS,
       frames,
+      bitrate: req.bitrate,
       signal: ac.signal,
       draw: async (f, ctx) => {
         const tf = performance.now();
@@ -794,7 +805,9 @@ function useData(file: RunsFile) {
     : '';
   el.privacy.textContent = state.approxHomes
     ? 'The track ends near every home were trimmed when the file was made, and the homes in it are rounded. With many runs, a home can still be estimated from where the trimmed tracks begin and end.'
-    : 'Every run starts at home, so the map and the video show where you live. The data file also lists every place you have run from often, so it shows where you have lived; it stays on this computer. Hiding the ends near home helps less than it seems: with many runs, home can still be found to within about a metre from where the tracks begin and end.';
+    : HOSTED
+      ? 'Every run starts at home, so the map and the video show where its owner lives, and the data behind this page lists every place they have run from often. Please don\'t share the password, the video or downloads from this page.'
+      : 'Every run starts at home, so the map and the video show where you live. The data file also lists every place you have run from often, so it shows where you have lived; it stays on this computer. Hiding the ends near home helps less than it seems: with many runs, home can still be found to within about a metre from where the tracks begin and end.';
   el.strength.value = String(autoStrength(state.all.length));
   updateStrength();
   el.load.hidden = true;
@@ -859,7 +872,9 @@ function startPicking() {
   setMapInteractive(true);
   el.pick.hidden = true;
   el.pickCancel.hidden = false;
-  el.pickStatus.textContent = 'Click the map where the runs start. Drag to pan, scroll to zoom.';
+  el.pickStatus.textContent = noHover()
+    ? 'Tap the map where the runs start, then tap there again or press "Use this spot". Drag to pan, pinch to zoom.'
+    : 'Click the map where the runs start. Drag to pan, scroll to zoom.';
   clearHud();
   el.stage.classList.add('picking');
   state.dirty = true;
@@ -869,9 +884,11 @@ function startPicking() {
 function stopPicking(restore = false) {
   state.picking = false;
   state.cursor = null;
+  state.preview = null;
   setMapInteractive(false);
   el.pick.hidden = false;
   el.pickCancel.hidden = true;
+  el.pickUse.hidden = true;
   el.pickStatus.textContent = '';
   el.stage.classList.remove('picking');
   el.home.value = state.homeId;
@@ -896,7 +913,7 @@ function renderPicking() {
         parameters: { depthCompare: 'always', depthWriteEnabled: false },
       }),
       new ScatterplotLayer<Home>({
-        id: 'cursor', data: state.cursor ? [state.cursor] : [], getPosition: (h) => [h.lon, h.lat], getRadius: r,
+        id: 'cursor', data: state.preview ? [state.preview] : state.cursor ? [state.cursor] : [], getPosition: (h) => [h.lon, h.lat], getRadius: r,
         radiusUnits: 'meters', stroked: true, filled: true, getFillColor: [255, 255, 255, 30], getLineColor: [255, 255, 255, 200],
         lineWidthUnits: 'pixels', getLineWidth: 1.5, parameters: { depthCompare: 'always', depthWriteEnabled: false },
       }),
@@ -904,39 +921,59 @@ function renderPicking() {
   });
 }
 
-function previewCount(h: Home): string {
+function previewCount(h: Home, tapped = false): string {
   const r = Number(el.radius.value);
   const rg = homeRange(state.all, h, r);
   const years = rg.count ? ` (${rg.first.slice(0, 4)}–${rg.last.slice(0, 4)})` : '';
-  return `${rg.count} runs start within ${r} m here${years}${state.approxHomes ? ' — approximate, the file was privacy-trimmed' : ''}. Click to use it.`;
+  return `${rg.count} runs start within ${r} m here${years}${state.approxHomes ? ' — approximate, the file was privacy-trimmed' : ''}. `
+    + (tapped ? 'Tap it again or press "Use this spot" to use it; tap elsewhere to move it.' : 'Click to use it.');
 }
 
+/** Devices without hover (phones, tablets): picking previews a spot on the first tap. */
+const noHover = () => typeof matchMedia === 'function' && matchMedia('(hover: none)').matches;
+
+// the pointer that started the last click or tap on the map (MapLibre's click event doesn't say)
+let lastPointer: PointerKind = 'mouse';
+map.getCanvasContainer().addEventListener('pointerdown', (e) => { lastPointer = pointerKind(e.pointerType); }, { capture: true });
+
 map.on('mousemove', (e) => {
-  if (!state.picking) return;
+  // browsers also send a mousemove after a tap: only a real mouse moves the preview
+  if (!state.picking || lastPointer !== 'mouse') return;
   state.cursor = { lat: e.lngLat.lat, lon: e.lngLat.lng };
   el.pickStatus.textContent = previewCount(state.cursor);
   state.dirty = true;
 });
 
-map.on('click', (e) => {
-  if (!state.picking) return;
-  // a click on (or right next to) a known home selects it instead of adding a duplicate
-  const hit = homeEntries()
-    .map((h) => ({ h, d: map.project([h.lon, h.lat]).dist(e.point) }))
-    .filter((x) => x.d <= 12)
-    .sort((a, b) => a.d - b.d)[0];
+function addPickedHome(at: Home) {
   stopPicking();
-  if (hit) {
-    selectHome(hit.h.id);
-    return;
-  }
-  const lat = Math.round(e.lngLat.lat * 1e5) / 1e5;
-  const lon = Math.round(e.lngLat.lng * 1e5) / 1e5;
+  const lat = Math.round(at.lat * 1e5) / 1e5;
+  const lon = Math.round(at.lon * 1e5) / 1e5;
   const id = customId(lat, lon);
   const dp = prefsForData();
   if (!dp.custom.some((c) => c.id === id)) dp.custom.push({ id, lat, lon });
   persist();
   selectHome(id);
+}
+
+map.on('click', (e) => {
+  if (!state.picking) return;
+  // a click on (or right next to) a known home selects it instead of adding a duplicate
+  const homes = homeEntries().map((h) => ({ id: h.id, d: map.project([h.lon, h.lat]).dist(e.point) }));
+  const prev = state.preview ? map.project([state.preview.lon, state.preview.lat]).dist(e.point) : null;
+  const act = pickAction(lastPointer, homes, prev);
+  if (act.kind === 'select') {
+    stopPicking();
+    selectHome(act.id);
+  } else if (act.kind === 'preview') {
+    state.preview = { lat: e.lngLat.lat, lon: e.lngLat.lng };
+    state.cursor = null;
+    el.pickStatus.textContent = previewCount(state.preview, true);
+    el.pickUse.hidden = false;
+    state.dirty = true;
+  } else {
+    // a tap confirms the spot it previewed; a click picks where it landed
+    addPickedHome(lastPointer !== 'mouse' && state.preview ? state.preview : { lat: e.lngLat.lat, lon: e.lngLat.lng });
+  }
 });
 
 /** Load data/runs.json, independently of the basemap, and say exactly what went wrong if it fails. */
@@ -947,10 +984,17 @@ async function loadDefault() {
   };
   let res: Response;
   try {
-    res = await fetch('data/runs.json', { cache: 'no-store' });
+    // relative, so it works at / (dev) and under the hosted path (/map/data/runs.json)
+    res = await fetch('data/runs.json', { cache: HOSTED ? 'no-cache' : 'no-store' });
   } catch (e) {
-    fail(`<div>Could not request <code>data/runs.json</code> (${escapeHtml((e as Error).message)}).</div>
+    fail(HOSTED
+      ? `<div>Could not load the run data (${escapeHtml((e as Error).message)}). Check the connection and reload.</div>`
+      : `<div>Could not request <code>data/runs.json</code> (${escapeHtml((e as Error).message)}).</div>
       <div>Is the dev server (<code>bun run dev</code>) still running?</div>`);
+    return;
+  }
+  if (HOSTED && !res.ok) {
+    fail(`<div>Could not load the run data: HTTP ${res.status}. Reload the page.</div>`);
     return;
   }
   if (res.status === 404) {
@@ -987,7 +1031,12 @@ el.scrub.oninput = () => { state.frame = Number(el.scrub.value); state.dirty = t
 for (const i of [el.from, el.to, el.seconds]) i.onchange = rebuild;
 el.radius.oninput = () => {
   el.radiusVal.textContent = `${el.radius.value} m`;
-  if (state.picking) { if (state.cursor) el.pickStatus.textContent = previewCount(state.cursor); state.dirty = true; return; }
+  if (state.picking) {
+    if (state.preview) el.pickStatus.textContent = previewCount(state.preview, true);
+    else if (state.cursor) el.pickStatus.textContent = previewCount(state.cursor);
+    state.dirty = true;
+    return;
+  }
   state.prefs.radii[state.homeId] = Number(el.radius.value);
   persist();
   syncDatesToHome(); // the home's runs, and so its years, depend on the radius
@@ -1003,6 +1052,7 @@ el.privacyRadius.oninput = () => {
 el.home.onchange = () => { if (el.home.value === 'pick') startPicking(); else selectHome(el.home.value); };
 el.pick.onclick = startPicking;
 el.pickCancel.onclick = () => stopPicking(true);
+el.pickUse.onclick = () => { if (state.picking && state.preview) addPickedHome(state.preview); };
 el.showSpots.onchange = fillHomes;
 el.homeName.oninput = () => {
   const name = el.homeName.value.trim();
@@ -1038,6 +1088,16 @@ window.addEventListener('keydown', (e) => {
   }
 });
 window.addEventListener('resize', layout);
+// the viewer also changes size when the phone bottom sheet opens or closes
+if (typeof ResizeObserver === 'function') new ResizeObserver(() => layout()).observe(el.viewer);
+el.sheetToggle.onclick = () => {
+  const open = !el.panel.classList.contains('open');
+  el.panel.classList.toggle('open', open);
+  el.sheetToggle.setAttribute('aria-expanded', String(open));
+  el.sheetToggle.textContent = open ? 'Close' : 'Settings';
+  if (!open) el.panel.scrollTop = 0;
+};
+if (HOSTED) el.back.hidden = false;
 
 // automation hook (used by the headless smoke test): window.homeRuns.export({seconds: 3})
 declare global {

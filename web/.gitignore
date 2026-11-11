@@ -4,3 +4,7 @@ dist/
 data/
 *.mp4
 *.webm
+# bun run build:site output: the hosted page WITH your runs.json, video and poster
+site/
+*.jpg
+*.jpeg

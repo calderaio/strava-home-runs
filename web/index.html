@@ -3,6 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex,nofollow" />
     <title>Home Runs</title>
     <link rel="icon" href="data:," />
   </head>
@@ -15,17 +16,21 @@
           <div id="message" hidden></div>
         </div>
       </main>
-      <aside id="panel">
-        <h1>Home runs</h1>
+      <aside id="panel" aria-label="Controls">
+        <header class="panel-head">
+          <h1>Home runs</h1>
+          <a id="back" class="back" href="../" hidden>← Video</a>
+        </header>
 
         <section class="transport">
           <div class="row">
             <button id="play" type="button" disabled>Play</button>
             <button id="replay" type="button" disabled>Replay</button>
             <span id="readout" class="mono">0:00 / 0:00</span>
+            <button id="sheet-toggle" class="sheet-toggle" type="button" aria-expanded="false" aria-controls="panel">Settings</button>
           </div>
           <input id="scrub" type="range" min="0" max="0" step="1" value="0" aria-label="Scrub" disabled />
-          <div class="row">
+          <div class="row transport-extra">
             <label>Speed
               <select id="speed">
                 <option value="0.25">0.25×</option>
@@ -37,7 +42,7 @@
             </label>
             <label>Length <input id="seconds" type="number" min="5" max="300" step="1" value="30" /> s</label>
           </div>
-          <p class="hint">Length is how many video seconds it takes until the longest run finishes.</p>
+          <p class="hint transport-extra">Length is how many video seconds it takes until the longest run finishes.</p>
         </section>
 
         <section>
@@ -46,6 +51,7 @@
           <label class="block">Name <input id="home-name" type="text" maxlength="80" placeholder="e.g. the neighbourhood" /></label>
           <div class="row">
             <button id="pick" type="button">Pick on map</button>
+            <button id="pick-use" type="button" hidden>Use this spot</button>
             <button id="pick-cancel" type="button" hidden>Cancel</button>
             <button id="forget" type="button" hidden>Remove this home</button>
           </div>

@@ -29,6 +29,6 @@ export default defineConfig({
   base: './',
   publicDir: false, // nothing under public/ is ever copied into a build
   plugins: [serveData()],
-  server: { watch: { ignored: ['**/data/**'] } },
+  server: { watch: { ignored: ['**/data/**', '**/site/**'] } },
   build: { target: 'es2022', chunkSizeWarningLimit: 3000 },
 });

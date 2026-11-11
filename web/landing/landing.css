@@ -1,0 +1,69 @@
+:root {
+  --bg: #000;
+  --text: #e8e8ee;
+  --muted: #8a8fa3;
+  --hot: #ff6e1e;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.4 "Avenir Next", "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+}
+
+/* title line, the video filling whatever height is left, then the button */
+main {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  height: 100dvh;
+  max-width: 640px;
+  margin: 0 auto;
+  padding: env(safe-area-inset-top) 16px env(safe-area-inset-bottom);
+}
+
+header {
+  flex: none;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0 10px;
+  padding: 10px 0 8px;
+}
+h1 { margin: 0; font-size: 18px; letter-spacing: 0.02em; }
+header p { margin: 0; color: var(--muted); font-size: 14px; }
+
+video {
+  flex: 1 1 auto;
+  min-height: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #000;
+  display: block;
+}
+
+nav { flex: none; padding: 10px 0 12px; text-align: center; }
+
+.cta {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 56px;
+  width: 100%;
+  border-radius: 12px;
+  background: var(--hot);
+  color: #160800;
+  font-size: 18px;
+  font-weight: 700;
+  text-decoration: none;
+}
+.cta:active { transform: translateY(1px); }
+.cta:focus-visible { outline: 3px solid #fff; outline-offset: 3px; }
+
+.credit { margin: 8px 0 0; color: var(--muted); font-size: 11px; }
